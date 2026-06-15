@@ -1,5 +1,11 @@
 node_modules
+
+# Build output
+dist
+/generated/prisma
+
+# Test coverage
+coverage
+
 # Keep environment variables out of version control
 .env
-
-/generated/prisma
