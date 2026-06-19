@@ -1,4 +1,4 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PoliciesGuard } from '../authz/policies.guard';
@@ -7,13 +7,16 @@ import { ZodValidationPipe } from '../common/zod-validation.pipe';
 import {
   demandSeriesQuerySchema,
   ok,
+  runForecastSchema,
   type ApiResponse,
   type DemandSeriesQueryInput,
   type JwtClaims,
+  type RunForecastInput,
 } from '../shared';
 import {
   ForecastingService,
   type DemandSeriesResponse,
+  type RunForecastResponse,
 } from './forecasting.service';
 
 /**
@@ -48,5 +51,16 @@ export class ForecastingController {
         query.to,
       ),
     );
+  }
+
+  // HU-08-02 · Genera el pronóstico: arma la serie y la envía a core-ai. read Report.
+  @Post('run')
+  @RequireAbility('read', 'Report')
+  async run(
+    @CurrentUser() claims: JwtClaims,
+    @Body(new ZodValidationPipe(runForecastSchema))
+    dto: RunForecastInput,
+  ): Promise<ApiResponse<RunForecastResponse>> {
+    return ok(await this.forecasting.runForecast(claims.tenant_id, dto));
   }
 }

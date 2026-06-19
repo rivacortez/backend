@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { AuthzModule } from '../authz/authz.module';
 import { PlatformModule } from '../platform/platform.module';
+import { CoreAiClient } from './core-ai.client';
 import { ForecastingController } from './forecasting.controller';
 import { ForecastingService } from './forecasting.service';
 
@@ -16,6 +17,6 @@ import { ForecastingService } from './forecasting.service';
 @Module({
   imports: [PlatformModule, AuthModule, AuthzModule],
   controllers: [ForecastingController],
-  providers: [ForecastingService],
+  providers: [ForecastingService, CoreAiClient],
 })
 export class ForecastingModule {}

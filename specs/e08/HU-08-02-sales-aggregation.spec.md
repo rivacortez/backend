@@ -16,10 +16,12 @@ Módulo nuevo `forecasting` (`ForecastingController` + `ForecastingService` + `s
 - **Zero-fill**: los días sin ventas entre el primero y el último se rellenan con `y=0` (un día sin venta es demanda 0, no un hueco — los modelos esperan una serie regular).
 - **Bucketing por día local (Lima, UTC-5 sin DST)**: `sold_on` se guarda en UTC; el día se calcula en la zona del tenant (lógica replicada inline, sin importar el módulo `reports` — frontera de módulos).
 - **Calidad del histórico** (`dataQuality`): `insufficient` (<6 meses), `few_shot` (≥6 meses), `good` (≥12 meses) — los umbrales que HU-11-03 asocia al forecasting.
+- **`POST /forecasting/run`** — genera el pronóstico end-to-end: arma la serie (mismo seam) y la envía a `core-ai` (`CoreAiClient` → `POST /forecast/run`). Body `{ scope, menuItemId?, horizon=14, from?, to?, engine? }`. Devuelve `{ series, forecast }` (la salida de core-ai validada con Zod). Si el histórico no alcanza el mínimo (2 puntos) → **422**. **Síncrono** (sin BullMQ todavía).
+  - `CoreAiClient`: URL de `CORE_AI_URL` (default `http://localhost:8000`). Errores de borde: red caída → **503**; core-ai no-ok o respuesta con forma inesperada → **502**.
 
 **Diferido (parte 2/2, HU-08-02 async):**
 
-- Llamar a `core-ai` `POST /forecast/run` con la serie, vía **BullMQ** (`ForecastRun` en `RUNNING`/`COMPLETED`, polling/SSE de progreso).
+- Envolver la llamada a `core-ai` en **BullMQ** (`ForecastRun` en `RUNNING`/`COMPLETED`, polling/SSE de progreso, reintentos) — requiere Redis + tabla `forecast_runs` (migración con RLS FORCE).
 - Persistir el pronóstico y exponer `GET /forecasting/predictions` (HU-08-04, predicciones por plato con quantiles).
 - Frecuencia semanal (`W`) y covariates peruanos (HU-08-07, XReg).
 
@@ -73,4 +75,5 @@ No se modifica la matriz CASL (coherente con E06/E07).
 ## Tests
 
 - **Unit — `src/forecasting/sales-aggregation.util.spec.ts` (8 casos)**: serie vacía; suma del mismo día; **zero-fill** de días intermedios; orden ascendente; filtro por `menuItemId` y exclusión de filas sin enlace; etiqueta = nombre más reciente; umbrales de `dataQuality`. Corre sin DB.
+- **Unit — `src/forecasting/core-ai.client.spec.ts` (4 casos)**: arma bien la request y parsea la respuesta; **502** si core-ai responde no-ok; **503** si la red falla; **502** si la respuesta tiene forma inesperada. `fetch` mockeado, sin core-ai real.
 - **e2e (parte 2/2 / a sumar)**: sembrar tenant + owner/manager/staff + `sales_history`; verificar la serie, el 403 de staff y el 400 de `scope=menuItem` sin `menuItemId`. Requiere la DB Docker local (RLS).
