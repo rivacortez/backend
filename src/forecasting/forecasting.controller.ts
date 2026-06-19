@@ -29,6 +29,7 @@ import {
   ForecastingService,
   type DemandSeriesResponse,
   type ForecastRunView,
+  type ForecastValidationView,
 } from './forecasting.service';
 
 /**
@@ -96,6 +97,24 @@ export class ForecastingController {
   ): Promise<ApiResponse<ForecastRunView>> {
     return ok(
       await this.forecasting.getLatestPredictions(
+        claims.tenant_id,
+        query.scope,
+        query.menuItemId,
+      ),
+    );
+  }
+
+  // HU-08-05 · Validación del último pronóstico vs real (predicho/real, error %,
+  // MAPE acumulado, cobertura del intervalo q10–q90). read Report.
+  @Get('validation')
+  @RequireAbility('read', 'Report')
+  async validation(
+    @CurrentUser() claims: JwtClaims,
+    @Query(new ZodValidationPipe(predictionsQuerySchema))
+    query: PredictionsQueryInput,
+  ): Promise<ApiResponse<ForecastValidationView>> {
+    return ok(
+      await this.forecasting.validateLatest(
         claims.tenant_id,
         query.scope,
         query.menuItemId,
