@@ -1,5 +1,6 @@
 import {
   BadGatewayException,
+  GatewayTimeoutException,
   Injectable,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -8,6 +9,10 @@ import {
   type CoreAiForecastResponse,
 } from '../shared';
 import { type HistoryPoint } from './sales-aggregation.util';
+
+// Tope de espera por la respuesta de core-ai. Sin esto, un core-ai colgado deja
+// la request de NestJS colgada indefinidamente (agotando recursos).
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 /** Body que espera `core-ai` en `POST /forecast/run` (snake_case, contrato Python). */
 export interface CoreAiForecastRequest {
@@ -30,6 +35,7 @@ export interface CoreAiForecastRequest {
 @Injectable()
 export class CoreAiClient {
   private readonly baseUrl = process.env.CORE_AI_URL ?? 'http://localhost:8000';
+  private readonly timeoutMs = this.resolveTimeout();
 
   async runForecast(
     request: CoreAiForecastRequest,
@@ -60,13 +66,27 @@ export class CoreAiClient {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (cause) {
+      if (
+        cause instanceof Error &&
+        (cause.name === 'TimeoutError' || cause.name === 'AbortError')
+      ) {
+        throw new GatewayTimeoutException(
+          `core-ai no respondió en ${this.timeoutMs}ms`,
+        );
+      }
       throw new ServiceUnavailableException(
         `No se pudo contactar a core-ai en ${this.baseUrl}`,
         { cause: cause instanceof Error ? cause : undefined },
       );
     }
+  }
+
+  private resolveTimeout(): number {
+    const value = Number(process.env.CORE_AI_TIMEOUT_MS);
+    return Number.isFinite(value) && value > 0 ? value : DEFAULT_TIMEOUT_MS;
   }
 
   private async safeJson(response: Response): Promise<unknown> {

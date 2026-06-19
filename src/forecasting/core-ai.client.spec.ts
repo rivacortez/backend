@@ -1,5 +1,6 @@
 import {
   BadGatewayException,
+  GatewayTimeoutException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -79,6 +80,18 @@ describe('CoreAiClient', () => {
     await expect(
       new CoreAiClient().runForecast(REQUEST),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
+  });
+
+  it('lanza GatewayTimeout (504) cuando core-ai no responde a tiempo', async () => {
+    // AbortSignal.timeout aborta con un error de nombre TimeoutError.
+    const timeout = Object.assign(new Error('timed out'), {
+      name: 'TimeoutError',
+    });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(timeout));
+
+    await expect(
+      new CoreAiClient().runForecast(REQUEST),
+    ).rejects.toBeInstanceOf(GatewayTimeoutException);
   });
 
   it('lanza BadGateway si la respuesta tiene forma inesperada', async () => {
