@@ -19,6 +19,10 @@ import {
 } from '../shared';
 import { CoreAiClient } from './core-ai.client';
 import {
+  compareForecastVsActual,
+  type ForecastValidation,
+} from './forecast-validation.util';
+import {
   zeroFillDailySeries,
   type AggregatedSeries,
   type DailyTotal,
@@ -60,6 +64,17 @@ export interface ForecastJobData {
   runId: string;
   tenantId: string;
   input: RunForecastInput;
+}
+
+/** Validación de un pronóstico contra el real (HU-08-05). */
+export interface ForecastValidationView {
+  runId: string;
+  scope: string;
+  menuItemId: string | null;
+  model: string | null;
+  completedAt: string | null;
+  rows: ForecastValidation['rows'];
+  summary: ForecastValidation['summary'];
 }
 
 /** Vista de una corrida persistida (lo que devuelven run/poll/predictions). */
@@ -218,6 +233,64 @@ export class ForecastingService {
   }
 
   /**
+   * HU-08-05 · Valida el último pronóstico completado contra la demanda real:
+   * por día, predicho vs real, error % (APE) y si el real cayó en el intervalo
+   * q10–q90; en el resumen, MAPE acumulado y cobertura del intervalo. Solo se
+   * comparan los días ya transcurridos (target_date <= último día con ventas);
+   * los futuros quedan `pending`. `runInTenant` (RLS FORCE).
+   */
+  async validateLatest(
+    tenantId: string,
+    scope: 'total' | 'menuItem',
+    menuItemId: string | undefined,
+  ): Promise<ForecastValidationView> {
+    const menuId = scope === 'menuItem' ? (menuItemId as string) : null;
+
+    return this.prisma.runInTenant(tenantId, async (tx) => {
+      const run = await tx.forecastRun.findFirst({
+        where: { scope, menuItemId: menuId, status: 'completed' },
+        orderBy: { completedAt: 'desc' },
+      });
+      if (!run) {
+        throw new NotFoundException(
+          'Aún no hay un pronóstico completado para ese ámbito',
+        );
+      }
+
+      const points = (run.points as unknown as ForecastPoint[] | null) ?? [];
+      const dates = points.map((p) => p.target_date).sort();
+      const actualByDay: Record<string, number> = {};
+
+      if (dates.length > 0) {
+        const from = new Date(`${dates[0]}T00:00:00-05:00`);
+        const to = new Date(`${dates[dates.length - 1]}T23:59:59-05:00`);
+        const [daily, maxDay] = await Promise.all([
+          this.dailyTotals(tx, menuId, from, to),
+          this.maxActualDay(tx, menuId),
+        ]);
+        const totalsByDay = new Map(daily.map((d) => [d.ds, d.y]));
+        for (const p of points) {
+          // Día transcurrido (hay datos hasta esa fecha) → comparar (0 si sin venta).
+          if (maxDay && p.target_date <= maxDay) {
+            actualByDay[p.target_date] = totalsByDay.get(p.target_date) ?? 0;
+          }
+        }
+      }
+
+      const validation = compareForecastVsActual(points, actualByDay);
+      return {
+        runId: run.id,
+        scope: run.scope,
+        menuItemId: run.menuItemId,
+        model: run.model,
+        completedAt: run.completedAt ? run.completedAt.toISOString() : null,
+        rows: validation.rows,
+        summary: validation.summary,
+      };
+    });
+  }
+
+  /**
    * Computa el pronóstico: arma la serie diaria desde `sales_history` (mismo seam)
    * y la envía a `core-ai`. Lo usa el worker. 422 si el histórico es insuficiente.
    */
@@ -280,19 +353,7 @@ export class ForecastingService {
     const menuId = scope === 'menuItem' ? (menuItemId as string) : null;
 
     return this.prisma.runInTenant(tenantId, async (tx) => {
-      // `sold_on - interval '5 hours'` = día local Lima (la columna es timestamp
-      // sin tz, en UTC). RLS filtra el tenant; nunca se filtra tenant_id en la app.
-      const daily = await tx.$queryRaw<DailyRow[]>(Prisma.sql`
-        SELECT to_char((sold_on - interval '5 hours')::date, 'YYYY-MM-DD') AS ds,
-               SUM(qty)::int AS y
-        FROM sales_history
-        WHERE (${menuId}::uuid IS NULL OR menu_item_id = ${menuId}::uuid)
-          AND (${from}::timestamp IS NULL OR sold_on >= ${from}::timestamp)
-          AND (${to}::timestamp IS NULL OR sold_on <= ${to}::timestamp)
-        GROUP BY 1
-        ORDER BY 1
-      `);
-
+      const daily = await this.dailyTotals(tx, menuId, from, to);
       const totals: DailyTotal[] = daily.map((r) => ({ ds: r.ds, y: r.y }));
       const seriesId = scope === 'menuItem' ? (menuItemId as string) : 'total';
       const label =
@@ -312,6 +373,39 @@ export class ForecastingService {
         points: series.points,
       };
     });
+  }
+
+  // Totales de demanda por día local (Lima): `sold_on - interval '5h'` (la columna
+  // es timestamp sin tz, en UTC). RLS filtra el tenant; nunca se filtra en la app.
+  private dailyTotals(
+    tx: Tx,
+    menuId: string | null,
+    from: Date | null,
+    to: Date | null,
+  ): Promise<DailyRow[]> {
+    return tx.$queryRaw<DailyRow[]>(Prisma.sql`
+      SELECT to_char((sold_on - interval '5 hours')::date, 'YYYY-MM-DD') AS ds,
+             SUM(qty)::int AS y
+      FROM sales_history
+      WHERE (${menuId}::uuid IS NULL OR menu_item_id = ${menuId}::uuid)
+        AND (${from}::timestamp IS NULL OR sold_on >= ${from}::timestamp)
+        AND (${to}::timestamp IS NULL OR sold_on <= ${to}::timestamp)
+      GROUP BY 1
+      ORDER BY 1
+    `);
+  }
+
+  // Último día local (Lima) con ventas para el ámbito; null si no hay ninguna.
+  private async maxActualDay(
+    tx: Tx,
+    menuId: string | null,
+  ): Promise<string | null> {
+    const rows = await tx.$queryRaw<{ ds: string | null }[]>(Prisma.sql`
+      SELECT to_char(max((sold_on - interval '5 hours')::date), 'YYYY-MM-DD') AS ds
+      FROM sales_history
+      WHERE (${menuId}::uuid IS NULL OR menu_item_id = ${menuId}::uuid)
+    `);
+    return rows[0]?.ds ?? null;
   }
 
   // Etiqueta del plato: nombre del MenuItem si existe; si fue borrado, el nombre
