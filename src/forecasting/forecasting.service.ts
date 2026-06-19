@@ -1,11 +1,20 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  UnprocessableEntityException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../platform/prisma/prisma.service';
+import { type CoreAiForecastResponse, type RunForecastInput } from '../shared';
+import { CoreAiClient } from './core-ai.client';
 import {
   zeroFillDailySeries,
   type AggregatedSeries,
   type DailyTotal,
 } from './sales-aggregation.util';
+
+// core-ai exige al menos 2 puntos para inferir; con menos no hay serie útil.
+const MIN_POINTS_TO_FORECAST = 2;
 
 /** Respuesta del seam de demanda: la serie + metadatos de calidad. Lo que `points`
  *  contiene es exactamente el `history` que consume `core-ai` (`frequency:"D"`). */
@@ -25,9 +34,65 @@ type DailyRow = { ds: string; y: number };
 
 type Tx = Prisma.TransactionClient;
 
+/** Pronóstico generado: metadatos de la serie de origen + salida de core-ai. */
+export interface RunForecastResponse {
+  series: Omit<DemandSeriesResponse, 'points'>;
+  forecast: CoreAiForecastResponse;
+}
+
 @Injectable()
 export class ForecastingService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly coreAi: CoreAiClient,
+  ) {}
+
+  /**
+   * HU-08-02 · Genera un pronóstico de demanda: arma la serie diaria desde
+   * `sales_history` (mismo seam) y la envía a `core-ai`. Síncrono por ahora (el
+   * wrap en BullMQ + `ForecastRun` es el siguiente incremento). Si el histórico no
+   * alcanza el mínimo para inferir, devuelve 422.
+   */
+  async runForecast(
+    tenantId: string,
+    input: RunForecastInput,
+  ): Promise<RunForecastResponse> {
+    const series = await this.demandSeries(
+      tenantId,
+      input.scope,
+      input.menuItemId,
+      input.from,
+      input.to,
+    );
+
+    if (series.points.length < MIN_POINTS_TO_FORECAST) {
+      throw new UnprocessableEntityException(
+        'Histórico insuficiente para pronosticar (se requieren al menos ' +
+          `${MIN_POINTS_TO_FORECAST} días con datos).`,
+      );
+    }
+
+    const forecast = await this.coreAi.runForecast({
+      series_id: series.seriesId,
+      frequency: series.frequency,
+      horizon: input.horizon,
+      history: series.points,
+      engine: input.engine,
+    });
+
+    return {
+      series: {
+        scope: series.scope,
+        seriesId: series.seriesId,
+        label: series.label,
+        frequency: series.frequency,
+        observations: series.observations,
+        spanDays: series.spanDays,
+        dataQuality: series.dataQuality,
+      },
+      forecast,
+    };
+  }
 
   /**
    * E08 · Construye la serie de demanda diaria (zero-filled) desde `sales_history`.

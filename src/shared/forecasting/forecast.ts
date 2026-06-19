@@ -30,3 +30,70 @@ export const demandSeriesQuerySchema = z
     path: ['menuItemId'],
   });
 export type DemandSeriesQueryInput = z.infer<typeof demandSeriesQuerySchema>;
+
+/**
+ * Motores de forecasting expuestos por `core-ai`. `auto` (default) elige el mejor
+ * disponible y degrada al baseline; `timesfm`/`chronos` están cableados en core-ai
+ * pero responden 501 hasta que se implemente su adapter.
+ */
+export const forecastEngineSchema = z.enum([
+  'auto',
+  'statsforecast',
+  'seasonalnaive',
+  'timesfm',
+  'chronos',
+]);
+export type ForecastEngine = z.infer<typeof forecastEngineSchema>;
+
+/**
+ * Input de `POST /forecasting/run`: arma la serie (igual que el seam) y pide el
+ * pronóstico a `core-ai`. `horizon` = nº de días a pronosticar (default 14).
+ */
+export const runForecastSchema = z
+  .object({
+    scope: demandSeriesScopeSchema.default('total'),
+    menuItemId: z.uuid().optional(),
+    horizon: z.number().int().positive().max(365).default(14),
+    from: z.iso.datetime({ offset: true }).optional(),
+    to: z.iso.datetime({ offset: true }).optional(),
+    engine: forecastEngineSchema.optional(),
+  })
+  .refine((q) => q.scope !== 'menuItem' || q.menuItemId !== undefined, {
+    message: 'menuItemId es requerido cuando scope=menuItem',
+    path: ['menuItemId'],
+  });
+export type RunForecastInput = z.infer<typeof runForecastSchema>;
+
+/**
+ * Mirror del contrato de respuesta de `core-ai` (`POST /forecast/run`). Zod es la
+ * única fuente de verdad; Pydantic la espeja del lado Python. Se valida la
+ * respuesta del microservicio antes de devolverla (defensa de borde).
+ */
+export const forecastPointSchema = z.object({
+  target_date: z.iso.date(),
+  yhat: z.number(),
+  yhat_lo: z.number(),
+  yhat_hi: z.number(),
+});
+export type ForecastPoint = z.infer<typeof forecastPointSchema>;
+
+export const backtestMetricsSchema = z.object({
+  holdout_size: z.number().int(),
+  model_smape: z.number(),
+  baseline_smape: z.number(),
+  improvement_pct: z.number(),
+});
+export type BacktestMetrics = z.infer<typeof backtestMetricsSchema>;
+
+export const coreAiForecastResponseSchema = z.object({
+  series_id: z.string(),
+  engine: z.string(),
+  model: z.string(),
+  baseline: z.string(),
+  frequency: z.string(),
+  points: z.array(forecastPointSchema),
+  backtest: backtestMetricsSchema.nullable(),
+});
+export type CoreAiForecastResponse = z.infer<
+  typeof coreAiForecastResponseSchema
+>;
