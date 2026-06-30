@@ -15,7 +15,10 @@ export function redisConnection(): ConnectionOptions {
   return {
     host: url.hostname,
     port: Number(url.port) || 6379,
+    ...(url.username ? { username: url.username } : {}),
     ...(url.password ? { password: url.password } : {}),
+    // Managed Redis (Upstash) requires TLS, signalled by the `rediss://` scheme.
+    ...(url.protocol === 'rediss:' ? { tls: {} } : {}),
     maxRetriesPerRequest: null,
   };
 }
