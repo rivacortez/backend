@@ -106,6 +106,16 @@ const CATEGORIES = [
 
 // stock/minStock en la unidad declarada; unitCost = PEN por esa unidad.
 // `low: true` fuerza stock < minStock (alimenta lowStockCount del dashboard).
+//
+// UNIT COSTS — precios de mercado Lima 2025 (fuente: Mercado Mayorista de Frutas
+// y La Parada, cotizaciones distribuidoras de pescado, referencias MINAGRI):
+//   - Seafood: lenguado S/40/kg, pulpo limpio S/30/kg, langostinos S/33/kg,
+//     conchas S/32/kg (corrección de S/45–60 → precios reales de distribuidor).
+//   - Verduras: limón S/8/kg (volátil 4–12), cilantro S/12/kg (hojas), camote S/3.5/kg.
+//   - Abarrotes: arroz S/4.5/kg, aceite S/9/L.
+//   - Carnes: lomo de res S/32/kg (pulpa limpia distribuidor mayorista), pollo S/17/kg.
+//   - Pisco: S/40/L (botella 750ml ≈ S/30, costo puro de insumo).
+// `low: true` fuerza stock < minStock (alimenta lowStockCount del dashboard).
 type IngSeed = {
   sku: string;
   name: string;
@@ -122,7 +132,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Pescado fresco (lenguado)',
     unit: 'kg',
     category: 'Pescados y Mariscos',
-    unitCost: 38,
+    unitCost: 40,
     stock: 12,
     minStock: 8,
   },
@@ -131,7 +141,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Pulpo',
     unit: 'kg',
     category: 'Pescados y Mariscos',
-    unitCost: 45,
+    unitCost: 30,
     stock: 4,
     minStock: 6,
     low: true,
@@ -141,7 +151,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Camarones',
     unit: 'kg',
     category: 'Pescados y Mariscos',
-    unitCost: 52,
+    unitCost: 33,
     stock: 7,
     minStock: 5,
   },
@@ -150,7 +160,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Conchas de abanico',
     unit: 'kg',
     category: 'Pescados y Mariscos',
-    unitCost: 60,
+    unitCost: 32,
     stock: 3,
     minStock: 5,
     low: true,
@@ -160,7 +170,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Limón',
     unit: 'kg',
     category: 'Verduras',
-    unitCost: 6,
+    unitCost: 8,
     stock: 18,
     minStock: 10,
   },
@@ -187,7 +197,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Ají amarillo',
     unit: 'kg',
     category: 'Verduras',
-    unitCost: 8,
+    unitCost: 9,
     stock: 6,
     minStock: 3,
   },
@@ -196,7 +206,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Cilantro',
     unit: 'kg',
     category: 'Verduras',
-    unitCost: 7,
+    unitCost: 12,
     stock: 2,
     minStock: 4,
     low: true,
@@ -206,7 +216,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Camote',
     unit: 'kg',
     category: 'Verduras',
-    unitCost: 3,
+    unitCost: 3.5,
     stock: 20,
     minStock: 8,
   },
@@ -215,7 +225,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Choclo',
     unit: 'kg',
     category: 'Verduras',
-    unitCost: 5,
+    unitCost: 4,
     stock: 14,
     minStock: 6,
   },
@@ -224,7 +234,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Arroz',
     unit: 'kg',
     category: 'Abarrotes',
-    unitCost: 4,
+    unitCost: 4.5,
     stock: 50,
     minStock: 20,
   },
@@ -251,7 +261,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Lomo de res',
     unit: 'kg',
     category: 'Carnes',
-    unitCost: 42,
+    unitCost: 32,
     stock: 9,
     minStock: 6,
   },
@@ -260,7 +270,7 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Pechuga de pollo',
     unit: 'kg',
     category: 'Carnes',
-    unitCost: 16,
+    unitCost: 17,
     stock: 11,
     minStock: 6,
   },
@@ -269,7 +279,8 @@ const INGREDIENTS: IngSeed[] = [
     name: 'Pisco quebranta',
     unit: 'L',
     category: 'Bebidas',
-    unitCost: 35,
+    // S/30 botella 750ml → S/40/L costo puro de insumo.
+    unitCost: 40,
     stock: 8,
     minStock: 4,
   },
@@ -294,7 +305,21 @@ const INGREDIENTS: IngSeed[] = [
 ];
 
 // Plato: receta (BOM por SKU+qty en la unidad del insumo) + precio de venta (PEN, IGV incl.).
-// Las qty se eligen para dar food cost ~25-40% (margen 60-75%).
+//
+// FOOD COST TARGET BANDS (food cost = ingredientCost / price):
+//   - Platos de mar (Ceviches, Tiradito, Pulpo, Arroz): 30–38%
+//   - Criollos (Lomo Saltado, Ají de Gallina, Causa Limeña): 28–35%
+//   - Bebidas (Pisco Sour, Chicha Morada): 18–26%
+//
+// BOM DESIGN RATIONALE:
+//   - effQty = qty × (1 + wasteFactor); ingredientCost = Σ effQty × unitCost.
+//   - Porciones calibradas con precios de mercado Lima 2025 para que cada plato
+//     caiga dentro de su banda objetivo. Se priorizó plausibilidad física
+//     (ceviche ~200–220g de pescado, tiradito presentación generosa, lomo saltado
+//     porción generosa para justificar precio de restobar).
+//   - Pisco Sour: BOM simplificado (no incluye clara de huevo ni jarabe de goma
+//     por ausencia de esos SKUs); la qty de pisco (90ml) absorbe ese costo diferencial
+//     para mantener el food cost en banda (≈18%).
 type DishSeed = {
   name: string;
   emoji: string;
@@ -305,137 +330,237 @@ type DishSeed = {
 };
 const DISHES: DishSeed[] = [
   {
+    // ingredientCost ≈ S/13.32 → food cost ≈ 31.7% (target 30–38%)
+    // PES-001: 0.22×1.10×40=9.68 | VER-001: 0.20×8=1.60 | VER-002: 0.10×4=0.40
+    // VER-003: 0.03×9=0.27 | VER-005: 0.02×12=0.24 | VER-006: 0.15×3.5=0.525
+    // VER-007: 0.15×4=0.60
     name: 'Ceviche Clásico',
     emoji: '🐟',
     category: 'Entradas',
     price: 42,
     prepMinutes: 15,
     bom: [
-      { sku: 'PES-001', qty: 0.2, waste: 0.1 },
-      { sku: 'VER-001', qty: 0.15 },
-      { sku: 'VER-002', qty: 0.08 },
-      { sku: 'VER-003', qty: 0.02 },
-      { sku: 'VER-005', qty: 0.01 },
-      { sku: 'VER-006', qty: 0.12 },
-      { sku: 'VER-007', qty: 0.1 },
+      { sku: 'PES-001', qty: 0.22, waste: 0.1 }, // 220g lenguado plated + 10% merma
+      { sku: 'VER-001', qty: 0.2 }, // 200g limón (leche de tigre generosa)
+      { sku: 'VER-002', qty: 0.1 }, // 100g cebolla
+      { sku: 'VER-003', qty: 0.03 }, // 30g ají limo
+      { sku: 'VER-005', qty: 0.02 }, // 20g cilantro
+      { sku: 'VER-006', qty: 0.15 }, // 150g camote
+      { sku: 'VER-007', qty: 0.15 }, // 150g choclo
     ],
   },
   {
+    // ingredientCost ≈ S/16.81 → food cost ≈ 32.3% (target 30–38%)
+    // PES-001: 0.13×1.10×40=5.72 | PES-002: 0.13×30=3.90 | PES-003: 0.13×33=4.29
+    // VER-001: 0.20×8=1.60 | VER-002: 0.10×4=0.40 | VER-006: 0.12×3.5=0.42
+    // VER-007: 0.12×4=0.48
     name: 'Ceviche Mixto',
     emoji: '🦐',
     category: 'Entradas',
     price: 52,
     prepMinutes: 18,
     bom: [
-      { sku: 'PES-001', qty: 0.12, waste: 0.1 },
-      { sku: 'PES-002', qty: 0.08 },
-      { sku: 'PES-003', qty: 0.08 },
-      { sku: 'VER-001', qty: 0.15 },
-      { sku: 'VER-002', qty: 0.08 },
-      { sku: 'VER-006', qty: 0.12 },
+      { sku: 'PES-001', qty: 0.13, waste: 0.1 }, // 130g lenguado + 10% merma
+      { sku: 'PES-002', qty: 0.13 }, // 130g pulpo
+      { sku: 'PES-003', qty: 0.13 }, // 130g camarones
+      { sku: 'VER-001', qty: 0.2 }, // 200g limón
+      { sku: 'VER-002', qty: 0.1 }, // 100g cebolla
+      { sku: 'VER-006', qty: 0.12 }, // 120g camote
+      { sku: 'VER-007', qty: 0.12 }, // 120g choclo
     ],
   },
   {
+    // ingredientCost ≈ S/14.57 → food cost ≈ 31.7% (target 30–38%)
+    // PES-001: 0.28×1.10×40=12.32 | VER-001: 0.18×8=1.44 | VER-004: 0.04×9=0.36
+    // VER-005: 0.015×12=0.18 | ABA-002: 0.03×9=0.27
     name: 'Tiradito de Lenguado',
     emoji: '🍣',
     category: 'Entradas',
     price: 46,
     prepMinutes: 12,
     bom: [
-      { sku: 'PES-001', qty: 0.22, waste: 0.1 },
-      { sku: 'VER-001', qty: 0.12 },
-      { sku: 'VER-004', qty: 0.03 },
-      { sku: 'VER-005', qty: 0.01 },
+      { sku: 'PES-001', qty: 0.28, waste: 0.1 }, // 280g lenguado (presentación generosa) + 10% merma
+      { sku: 'VER-001', qty: 0.18 }, // 180g limón (leche de tigre)
+      { sku: 'VER-004', qty: 0.04 }, // 40g ají amarillo (crema)
+      { sku: 'VER-005', qty: 0.015 }, // 15g cilantro
+      { sku: 'ABA-002', qty: 0.03 }, // 30ml aceite (aliño)
     ],
   },
   {
+    // ingredientCost ≈ S/8.80 → food cost ≈ 31.4% (target 28–35%)
+    // VER-006: 0.40×3.5=1.40 | CAR-002: 0.35×17=5.95 | VER-004: 0.05×9=0.45
+    // VER-001: 0.08×8=0.64 | ABA-002: 0.04×9=0.36
     name: 'Causa Limeña',
     emoji: '🥔',
     category: 'Entradas',
     price: 28,
     prepMinutes: 20,
     bom: [
-      { sku: 'VER-006', qty: 0.25 },
-      { sku: 'CAR-002', qty: 0.1 },
-      { sku: 'VER-004', qty: 0.02 },
-      { sku: 'VER-001', qty: 0.05 },
-      { sku: 'ABA-002', qty: 0.03 },
+      { sku: 'VER-006', qty: 0.4 }, // 400g camote (base similar a papa amarilla)
+      { sku: 'CAR-002', qty: 0.35 }, // 350g pollo deshilachado (relleno generoso)
+      { sku: 'VER-004', qty: 0.05 }, // 50g ají amarillo
+      { sku: 'VER-001', qty: 0.08 }, // 80g limón
+      { sku: 'ABA-002', qty: 0.04 }, // 40ml aceite
     ],
   },
   {
+    // ingredientCost ≈ S/14.31 → food cost ≈ 29.8% (target 28–35%)
+    // CAR-001: 0.35×1.05×32=11.76 | VER-002: 0.15×4=0.60 | ABA-001: 0.20×4.5=0.90
+    // ABA-002: 0.06×9=0.54 | VER-005: 0.02×12=0.24 | VER-004: 0.03×9=0.27
     name: 'Lomo Saltado',
     emoji: '🥩',
     category: 'Principales',
     price: 48,
     prepMinutes: 18,
     bom: [
-      { sku: 'CAR-001', qty: 0.2, waste: 0.05 },
-      { sku: 'VER-002', qty: 0.1 },
-      { sku: 'ABA-001', qty: 0.15 },
-      { sku: 'ABA-002', qty: 0.04 },
-      { sku: 'VER-005', qty: 0.01 },
+      { sku: 'CAR-001', qty: 0.35, waste: 0.05 }, // 350g lomo (porción generosa restobar) + 5% merma
+      { sku: 'VER-002', qty: 0.15 }, // 150g cebolla
+      { sku: 'ABA-001', qty: 0.2 }, // 200g arroz
+      { sku: 'ABA-002', qty: 0.06 }, // 60ml aceite wok
+      { sku: 'VER-005', qty: 0.02 }, // 20g cilantro
+      { sku: 'VER-004', qty: 0.03 }, // 30g ají amarillo
     ],
   },
   {
+    // ingredientCost ≈ S/17.955 → food cost ≈ 33.2% (target 30–38%)
+    // ABA-001: 0.25×4.5=1.125 | PES-003: 0.25×33=8.25 | PES-004: 0.22×32=7.04
+    // VER-004: 0.05×9=0.45 | VER-002: 0.10×4=0.40 | ABA-002: 0.05×9=0.45
+    // VER-005: 0.02×12=0.24
     name: 'Arroz con Mariscos',
     emoji: '🍤',
     category: 'Principales',
     price: 54,
     prepMinutes: 25,
     bom: [
-      { sku: 'ABA-001', qty: 0.18 },
-      { sku: 'PES-003', qty: 0.1 },
-      { sku: 'PES-004', qty: 0.08 },
-      { sku: 'VER-004', qty: 0.03 },
-      { sku: 'VER-002', qty: 0.06 },
-      { sku: 'ABA-002', qty: 0.04 },
+      { sku: 'ABA-001', qty: 0.25 }, // 250g arroz
+      { sku: 'PES-003', qty: 0.25 }, // 250g camarones
+      { sku: 'PES-004', qty: 0.22 }, // 220g conchas de abanico
+      { sku: 'VER-004', qty: 0.05 }, // 50g ají amarillo
+      { sku: 'VER-002', qty: 0.1 }, // 100g cebolla
+      { sku: 'ABA-002', qty: 0.05 }, // 50ml aceite
+      { sku: 'VER-005', qty: 0.02 }, // 20g cilantro
     ],
   },
   {
+    // ingredientCost ≈ S/10.74 → food cost ≈ 29.8% (target 28–35%)
+    // CAR-002: 0.42×17=7.14 | VER-004: 0.15×9=1.35 | ABA-001: 0.22×4.5=0.99
+    // ABA-002: 0.06×9=0.54 | VER-002: 0.08×4=0.32 | VER-001: 0.05×8=0.40
     name: 'Ají de Gallina',
     emoji: '🍛',
     category: 'Principales',
     price: 36,
     prepMinutes: 30,
     bom: [
-      { sku: 'CAR-002', qty: 0.22 },
-      { sku: 'VER-004', qty: 0.05 },
-      { sku: 'ABA-001', qty: 0.15 },
-      { sku: 'ABA-002', qty: 0.04 },
+      { sku: 'CAR-002', qty: 0.42 }, // 420g pechuga (porción generosa + salsa)
+      { sku: 'VER-004', qty: 0.15 }, // 150g ají amarillo (base de la salsa)
+      { sku: 'ABA-001', qty: 0.22 }, // 220g arroz
+      { sku: 'ABA-002', qty: 0.06 }, // 60ml aceite
+      { sku: 'VER-002', qty: 0.08 }, // 80g cebolla
+      { sku: 'VER-001', qty: 0.05 }, // 50g limón
     ],
   },
   {
+    // ingredientCost ≈ S/18.10 → food cost ≈ 31.2% (target 30–38%)
+    // PES-002: 0.44×1.25×30=16.50 | ABA-002: 0.08×9=0.72 | VER-002: 0.06×4=0.24
+    // VER-001: 0.08×8=0.64
+    // waste=0.25: el pulpo pierde ~20–25% durante cocción y limpieza de ventosas.
     name: 'Pulpo al Olivo',
     emoji: '🐙',
     category: 'Principales',
     price: 58,
     prepMinutes: 22,
     bom: [
-      { sku: 'PES-002', qty: 0.2, waste: 0.1 },
-      { sku: 'ABA-002', qty: 0.05 },
-      { sku: 'VER-002', qty: 0.04 },
+      { sku: 'PES-002', qty: 0.44, waste: 0.25 }, // 440g pulpo plated + 25% merma cocción
+      { sku: 'ABA-002', qty: 0.08 }, // 80ml aceite de oliva (salsa)
+      { sku: 'VER-002', qty: 0.06 }, // 60g cebolla
+      { sku: 'VER-001', qty: 0.08 }, // 80g limón
     ],
   },
   {
+    // ingredientCost ≈ S/4.32 → food cost ≈ 18.0% (target 18–26%)
+    // BEB-001: 0.09×40=3.60 | VER-001: 0.09×8=0.72
+    // Nota: BOM simplificado (sin huevo/azúcar — SKUs no sembrados). Los 90ml de
+    // pisco representan el costo "all-in" de la bebida (pisco 65ml + absorción
+    // proporcional de clara de huevo S/0.50 y jarabe de goma S/0.10).
     name: 'Pisco Sour',
     emoji: '🍸',
     category: 'Bebidas',
     price: 24,
     prepMinutes: 5,
     bom: [
-      { sku: 'BEB-001', qty: 0.06 },
-      { sku: 'VER-001', qty: 0.04 },
+      { sku: 'BEB-001', qty: 0.09 }, // 90ml pisco (incluye absorción costos no sembrados)
+      { sku: 'VER-001', qty: 0.09 }, // 90g limón (jugo + extra para presentación)
     ],
   },
   {
+    // ingredientCost ≈ S/3.00 → food cost ≈ 25.0% (target 18–26%)
+    // BEB-002: 0.25×12=3.00 — sin cambio, ya estaba en banda.
     name: 'Chicha Morada',
     emoji: '🟣',
     category: 'Bebidas',
     price: 12,
     prepMinutes: 3,
-    bom: [{ sku: 'BEB-002', qty: 0.25 }],
+    bom: [{ sku: 'BEB-002', qty: 0.25 }], // 250ml concentrado
   },
 ];
+
+/**
+ * Non-uniform popularity weights — indexed parallel to DISHES array (length=10).
+ *
+ * PURPOSE: makes dish sales non-uniform so the Menu Engineering report (Kasavana-Smith
+ * matrix) shows ALL FOUR quadrants: Star / Plowhorse / Puzzle / Dog.
+ *
+ * MATH (N=10 dishes, popularityCutoff = 0.70/10 = 7%):
+ *   An item is "high popularity" if its share of total units sold ≥ 7%.
+ *   An item is "high profitability" if its CM ≥ avgCM (simple average).
+ *   avgCM ≈ S/27.81 (unweighted mean of price − ingredient cost across all 10 dishes).
+ *
+ * QUADRANT ASSIGNMENT (shares approximate DISH_WEIGHTS / 100):
+ *   Stars      (high pop ≥7%, high CM ≥ S/27.81):
+ *     Ceviche Clásico (15%), Ceviche Mixto (18%), Tiradito (8%), Lomo Saltado (17%)
+ *   Plowhorses (high pop ≥7%, low CM < S/27.81):
+ *     Pisco Sour (12%), Chicha Morada (13%)
+ *   Puzzles    (low pop <7%, high CM):
+ *     Arroz con Mariscos (6%), Pulpo al Olivo (3%)
+ *   Dogs       (low pop <7%, low CM):
+ *     Causa Limeña (4%), Ají de Gallina (4%)
+ *
+ * Applied in buildLines() (real June sales → used by prime-cost + menu-engineering)
+ * AND in the 6-month salesHistory loop (forecasting coherence).
+ */
+const DISH_WEIGHTS = [
+  15, // idx 0 Ceviche Clásico     → Star      (CM S/28.68 > S/27.81)
+  18, // idx 1 Ceviche Mixto       → Star      (CM S/35.19)
+  8, // idx 2 Tiradito de Lenguado→ Star      (CM S/31.43)
+  4, // idx 3 Causa Limeña        → Dog       (CM S/19.20)
+  17, // idx 4 Lomo Saltado        → Star      (CM S/33.69)
+  6, // idx 5 Arroz con Mariscos  → Puzzle    (CM S/36.05)
+  4, // idx 6 Ají de Gallina      → Dog       (CM S/25.26)
+  3, // idx 7 Pulpo al Olivo      → Puzzle    (CM S/39.90)
+  12, // idx 8 Pisco Sour          → Plowhorse (CM S/19.68)
+  13, // idx 9 Chicha Morada       → Plowhorse (CM S/ 9.00)
+] as const;
+
+/** Sum of all weights (= 100 for easy percent reading). */
+const DISH_WEIGHT_TOTAL = DISH_WEIGHTS.reduce(
+  (s: number, w: number) => s + w,
+  0,
+); // 100
+
+/**
+ * Samples a dish index (0..9) proportional to DISH_WEIGHTS using the deterministic
+ * PRNG. Replaces the uniform randInt in buildLines() and salesHistory seeding.
+ */
+function weightedPickDishIndex(): number {
+  const r = rnd() * DISH_WEIGHT_TOTAL;
+  let cum = 0;
+  for (let i = 0; i < DISH_WEIGHTS.length; i++) {
+    cum += DISH_WEIGHTS[i];
+    if (r < cum) return i;
+  }
+  // Floating-point edge case: return last index.
+  return DISH_WEIGHTS.length - 1;
+}
 
 const ZONES = [
   { name: 'Salón', position: 0 },
@@ -462,12 +587,31 @@ const TABLES: TableSeed[] = [
   { code: 'T5', zone: 'Terraza', capacity: 2, status: 'free' },
 ];
 
+// OVERHEAD ALIGNMENT — "Sueldos de planilla" is the TOTAL LABOUR COST TO THE
+// EMPLOYER (costo laboral total), not just base salaries. For a Lima restobar
+// this includes:
+//   Base salaries (13 employees):       S/23,650
+//   EsSalud 9%:                         S/ 2,129
+//   CTS 8.33%:                          S/ 1,971
+//   Gratificaciones Jul+Dic 16.67%:     S/ 3,944
+//   SCTR + seguro de vida ~2%:          S/   473
+//   Horas extras / reemplazos ~5%:      S/ 1,183
+//   Uniformes / EPP / beneficios ~10%:  S/ 2,365
+//   TOTAL costo planilla:               S/35,715 → rounded to S/35,700
+//
+// P&L prime-cost target (period 2026-06, revenue ≈ S/137,846):
+//   laborCost% = 35,700 / 137,846 ≈ 25.9%  (target band 24–30%) ✓
+//   foodCost%  ≈ 30.2%  (fixed by BOM, target 30–33%)          ✓
+//   primeCost% ≈ 56.1%  (target 55–62%, status 'good' ≤60%)    ✓
+//
+// Total CIF = 6,500 + 1,800 + 35,700 + 950 + 600 + 850 = S/46,400/mes.
 const OVERHEADS = [
   { concept: 'Alquiler del local', amount: 6500 },
   { concept: 'Luz y agua', amount: 1800 },
-  { concept: 'Sueldos de planilla', amount: 9200 },
+  { concept: 'Sueldos de planilla', amount: 35700 },
   { concept: 'Gas y combustible', amount: 950 },
   { concept: 'Marketing y publicidad', amount: 600 },
+  { concept: 'Servicios y limpieza', amount: 850 },
 ];
 
 /** Valid position codes for the Employee model (mirrored from the Zod schema). */
@@ -479,7 +623,7 @@ type EmployeeSeed = {
   /** 8-digit Peruvian DNI — @@unique per tenant. */
   dni: string;
   position: EmployeePosition;
-  /** Monthly salary in PEN. */
+  /** Monthly base salary in PEN (≥ RMV S/1,130). */
   salary: number;
   phone: string;
   /** YYYY-MM-DD; stored as @db.Date. */
@@ -492,57 +636,144 @@ type EmployeeSeed = {
 };
 
 /**
- * Five demo employees for Motif Restobar — realistic Peruvian names, salaries
- * aligned with Lima hospitality market (PEN, 2024–2025), and varied positions
- * so the Empleados tab shows a complete roster on camera. DNIs are deterministic
- * to keep re-seeds idempotent (cleanTenant() deletes before re-inserting).
+ * Thirteen-employee roster for Motif Restobar Karaoke — reflects a realistic
+ * busy Lima restobar (2024-2026):
+ *   - 4 cocina  (chef + sous chef + 2 cocineros de línea)
+ *   - 5 mozos   (atención al salón y terraza)
+ *   - 2 caja    (turnos mediodía / noche)
+ *   - 1 barra   (bartender)
+ *   - 1 encargado / administración
+ *
+ * Base salaries (PEN/mes): sum = S/23,650.
+ * Total employer cost (planilla): base × 1.351 (EsSalud 9% + CTS 8.33% +
+ * gratificaciones 16.67% + SCTR ~1%) = S/31,950 → see OVERHEADS.
+ *
+ * DNIs are deterministic 8-digit codes, all unique within this tenant.
+ * One employee (Carlos Quispe, mozo) is linked to the staff@motif.pe platform account.
  */
 const EMPLOYEES: EmployeeSeed[] = [
+  // Encargado / administración
   {
-    firstName: 'Carlos',
-    lastName: 'Quispe Mamani',
-    dni: '72834951',
-    position: 'mozo',
-    salary: 1400,
-    phone: '987654321',
-    hiredAt: '2023-03-15',
-    linkStaff: true, // maps to the seeded staff@motif.pe user account
+    firstName: 'Jorge',
+    lastName: 'Tapia Ramos',
+    dni: '71293845',
+    position: 'otro',
+    salary: 3500,
+    phone: '943210987',
+    hiredAt: '2021-11-05',
   },
-  {
-    firstName: 'Lucía',
-    lastName: 'Torres Vásquez',
-    dni: '45618273',
-    position: 'caja',
-    salary: 1600,
-    phone: '976543210',
-    hiredAt: '2022-08-01',
-  },
+  // Cocina (4)
   {
     firstName: 'Renzo',
     lastName: 'Palomino Cruz',
     dni: '68291047',
-    position: 'cocina',
-    salary: 2200,
+    position: 'cocina', // chef / jefe de cocina
+    salary: 2600,
     phone: '965432109',
     hiredAt: '2023-06-20',
+  },
+  {
+    firstName: 'David',
+    lastName: 'Mamani Condori',
+    dni: '73829164',
+    position: 'cocina', // sous chef
+    salary: 2200,
+    phone: '956341087',
+    hiredAt: '2023-09-01',
+  },
+  {
+    firstName: 'Ana',
+    lastName: 'Rojas Sánchez',
+    dni: '62847391',
+    position: 'cocina', // cocinera de línea
+    salary: 1800,
+    phone: '947231890',
+    hiredAt: '2024-03-15',
   },
   {
     firstName: 'Valeria',
     lastName: 'Huanca Flores',
     dni: '53742816',
-    position: 'cocina',
-    salary: 1850,
+    position: 'cocina', // cocinera de línea
+    salary: 1700,
     phone: '954321098',
     hiredAt: '2024-01-10',
   },
+  // Mozos / atención (5)
   {
-    firstName: 'Jorge',
-    lastName: 'Tapia Ramos',
-    dni: '71293845',
-    position: 'otro', // encargado de local
-    salary: 2800,
-    phone: '943210987',
-    hiredAt: '2021-11-05',
+    firstName: 'Carlos',
+    lastName: 'Quispe Mamani',
+    dni: '72834951',
+    position: 'mozo',
+    salary: 1500,
+    phone: '987654321',
+    hiredAt: '2023-03-15',
+    linkStaff: true, // maps to the seeded staff@motif.pe user account
+  },
+  {
+    firstName: 'Pedro',
+    lastName: 'Ccallo Flores',
+    dni: '84726193',
+    position: 'mozo',
+    salary: 1450,
+    phone: '938274651',
+    hiredAt: '2023-11-20',
+  },
+  {
+    firstName: 'Sandra',
+    lastName: 'Vega Mora',
+    dni: '61829347',
+    position: 'mozo',
+    salary: 1400,
+    phone: '929163847',
+    hiredAt: '2024-05-10',
+  },
+  {
+    firstName: 'Luis',
+    lastName: 'Torres Paz',
+    dni: '79382614',
+    position: 'mozo',
+    salary: 1400,
+    phone: '918274365',
+    hiredAt: '2024-06-01',
+  },
+  {
+    firstName: 'María',
+    lastName: 'Condori Quispe',
+    dni: '56193847',
+    position: 'mozo',
+    salary: 1350,
+    phone: '907162534',
+    hiredAt: '2025-01-15',
+  },
+  // Caja (2)
+  {
+    firstName: 'Lucía',
+    lastName: 'Torres Vásquez',
+    dni: '45618273',
+    position: 'caja',
+    salary: 1700,
+    phone: '976543210',
+    hiredAt: '2022-08-01',
+  },
+  {
+    firstName: 'Rosa',
+    lastName: 'Mamani León',
+    dni: '58362941',
+    position: 'caja',
+    salary: 1550,
+    phone: '895632147',
+    hiredAt: '2023-07-01',
+  },
+  // Barra (1)
+  {
+    firstName: 'Kevin',
+    lastName: 'Ríos Castillo',
+    dni: '67284931',
+    position: 'otro', // bartender
+    salary: 1500,
+    phone: '884521963',
+    hiredAt: '2022-12-01',
   },
 ];
 
@@ -591,6 +822,21 @@ async function main(): Promise<void> {
   const now = new Date();
   const today = startOfLimaDay(now);
   const period = currentPeriod(now);
+
+  // Last complete calendar month (Lima): used to seed overhead costs AND a full
+  // month of real Sales so the "Costeo y márgenes" view defaults to realistic margins.
+  // Costing is retrospective — the current month-to-date always has too few units,
+  // making cifPerUnit explode. The last complete month has ~450+ sales → cifPerUnit ≈ S/5–8.
+  const localNow = new Date(now.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE);
+  const nowYear = localNow.getUTCFullYear();
+  const nowMonth = localNow.getUTCMonth() + 1; // 1-indexed
+  const lastMonthYear = nowMonth === 1 ? nowYear - 1 : nowYear;
+  const lastMonthNum = nowMonth === 1 ? 12 : nowMonth - 1; // 1-indexed
+  const lastMonthPeriod = `${lastMonthYear}-${String(lastMonthNum).padStart(2, '0')}`;
+  // Date.UTC uses 0-indexed months; passing lastMonthNum (1-indexed) gives month+1 day-0 = last day of lastMonth.
+  const daysInLastMonth = new Date(
+    Date.UTC(lastMonthYear, lastMonthNum, 0),
+  ).getUTCDate();
 
   // Resolver el tenant REAL del usuario demo. seed.ts crea el tenant con un id
   // aleatorio, así que no acoplamos a un UUID fijo (evita P2025 al re-seedear
@@ -782,34 +1028,56 @@ async function main(): Promise<void> {
     `  ✓ ${ZONES.length} zonas + ${TABLES.length} mesas (${occupiedTables.length} ocupadas)`,
   );
 
-  // 6) CIF (overhead) del período actual.
-  for (const o of OVERHEADS) {
-    await prisma.overheadCost.create({
-      data: {
-        tenantId: TENANT_ID,
-        period,
-        concept: o.concept,
-        amount: o.amount,
-      },
-    });
+  // 6) CIF (overhead) del período actual Y del último mes completo.
+  // El costeo es retrospectivo: la vista "Costeo y márgenes" hace default al mes
+  // anterior. Sembrar CIF en ambos períodos garantiza que whichever el usuario
+  // seleccione tenga prorrateo de costos indirectos disponible.
+  const periodsForCif = [lastMonthPeriod, period];
+  for (const cifPeriod of periodsForCif) {
+    for (const o of OVERHEADS) {
+      await prisma.overheadCost.create({
+        data: {
+          tenantId: TENANT_ID,
+          period: cifPeriod,
+          concept: o.concept,
+          amount: o.amount,
+        },
+      });
+    }
   }
-  console.log(`  ✓ ${OVERHEADS.length} CIF del período ${period}`);
+  console.log(
+    `  ✓ ${OVERHEADS.length * 2} CIF: períodos ${lastMonthPeriod} + ${period}`,
+  );
 
   // 7) Histórico de ventas (~6 meses+) por plato (sales_history) — para forecasting.
   // dayBack=187 para superar el umbral FEW_SHOT_MIN_DAYS=180 de sales-aggregation.util.ts
   // y que el endpoint /forecasting/series devuelva dataQuality='few_shot' o 'good'.
+  // Non-uniform history: the average weight per dish is DISH_WEIGHT_TOTAL / N = 10.
+  // A dish's baseQty is scaled by (weight/avgWeight) so popular dishes accumulate
+  // higher historical sales — matching the real-sales non-uniform mix and producing
+  // coherent forecasting shopping suggestions.
+  const HIST_AVG_WEIGHT = DISH_WEIGHT_TOTAL / DISH_WEIGHTS.length; // 10
   let historyRows = 0;
   for (let dayBack = 187; dayBack >= 8; dayBack--) {
     const soldOn = new Date(today.getTime() - dayBack * MS_PER_DAY);
-    // factor estacional: fines de semana venden más.
+    // Seasonal factor: weekends sell ~60% more.
     const dow = new Date(
       soldOn.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE,
     ).getUTCDay();
     const weekendBoost = dow === 0 || dow === 6 ? 1.6 : 1.0;
-    for (const mi of menuItems) {
-      // no todos los platos se venden todos los días.
-      if (rnd() > 0.85) continue;
-      const baseQty = randInt(2, 9);
+    for (let dishIdx = 0; dishIdx < menuItems.length; dishIdx++) {
+      const mi = menuItems[dishIdx];
+      if (!mi) continue;
+      // Popularity-aware skip: rare dishes appear fewer days than popular ones.
+      // skipThreshold = (weight/total) × 5 → inclusion rates:
+      //   Ceviche Mixto (18): 90% | Lomo (17): 85% | Pisco Sour (12): 60%
+      //   Arroz Mariscos (6): 30% | Pulpo al Olivo (3): 15% | Dogs (4): 20%
+      const weight = DISH_WEIGHTS[dishIdx] ?? HIST_AVG_WEIGHT;
+      const skipThreshold = (weight / DISH_WEIGHT_TOTAL) * 5;
+      if (rnd() > skipThreshold) continue;
+      // Scale quantity by relative popularity (vs the average weight of 10).
+      const popularityScale = weight / HIST_AVG_WEIGHT;
+      const baseQty = Math.max(1, Math.round(randInt(2, 9) * popularityScale));
       const qty = Math.max(1, Math.round(baseQty * weekendBoost));
       const unitPrice = mi.price;
       const total = unitPrice.mul(qty);
@@ -1080,11 +1348,17 @@ async function main(): Promise<void> {
     });
 
     // Los insumos principales con precio variable (simulan variación de mercado).
+    // Series de 6 meses que TERMINAN en el unitCost actual de cada insumo
+    // (índice 0=más antiguo ~-6meses, índice 5=más reciente ≈ unitCost actual).
+    // Lenguado: tendencia alcista gradual → 40 actual.
+    // Pulpo/Camarones: corrección a la baja desde precios previos sobreestimados;
+    //   serie volátil terminando en precio real de distribuidor Lima 2025.
+    // Lomo de res: fluctuación razonable terminando en 32 (precio mayorista).
     const priceSeriesByName: Record<string, number[]> = {
-      'Pescado fresco (lenguado)': [32, 34, 35, 36, 38, 40],
-      Pulpo: [38, 40, 42, 43, 45, 47],
-      Camarones: [44, 46, 48, 50, 52, 54],
-      'Lomo de res': [36, 38, 39, 40, 42, 44],
+      'Pescado fresco (lenguado)': [34, 36, 37, 38, 39, 40],
+      Pulpo: [26, 24, 28, 26, 30, 30],
+      Camarones: [28, 30, 31, 32, 31, 33],
+      'Lomo de res': [27, 29, 30, 31, 30, 32],
     };
 
     // Obtener IDs de los insumos por nombre.
@@ -1336,10 +1610,12 @@ async function main(): Promise<void> {
     }[] = [];
     const used = new Set<number>();
     for (let i = 0; i < n; i++) {
-      let idx = randInt(0, menuItems.length - 1);
+      // Non-uniform selection: popular dishes (Stars/Plowhorses) are chosen more
+      // often than Puzzles/Dogs, mirroring real restobar ordering patterns.
+      // weightedPickDishIndex() samples from DISH_WEIGHTS proportionally.
+      let idx = weightedPickDishIndex();
       let guard = 0;
-      while (used.has(idx) && guard++ < 10)
-        idx = randInt(0, menuItems.length - 1);
+      while (used.has(idx) && guard++ < 10) idx = weightedPickDishIndex();
       used.add(idx);
       lines.push({ item: menuItems[idx], qty: randInt(1, 3) });
     }
@@ -1403,6 +1679,69 @@ async function main(): Promise<void> {
   }
   console.log(`  ✓ ${weekSales} ventas en los 6 días previos (sparkline 7d)`);
 
+  // 8c) Ventas del ÚLTIMO MES COMPLETO (para costeo con márgenes realistas y
+  //     para alimentar prime-cost + menu-engineering con datos de junio 2026).
+  //
+  // CIF TOTAL (junio): S/46,400 (incluyendo sueldos planilla S/35,700).
+  // Note: revenue for prime-cost includes step-8b June 25-30 tickets too (~S/16k),
+  // so total June revenue ≈ S/137,800 (step 8c ≈ S/121,276 + step 8b June ≈ S/16,570).
+  // cifPerUnit ≈ S/46,400 / 3,500 ≈ S/13.3 (total June dish-units step 8b+8c).
+  // Per-dish net margin = price − foodCost − cifPerUnit:
+  //   Ceviche Clásico: S/42 − S/13.32 − S/13.3 = S/15.38 ✓
+  //   Chicha Morada:   S/12 − S/ 3.00 − S/13.3 = −S/4.30 (thin but realistic:
+  //   cheap drink subsidised by premium dishes — good thesis talking point).
+  //
+  // PRIME COST objetivo (junio, período 2026-06):
+  //   revenue ≈ S/137,846 · foodCost% ≈ 30.2% · laborCost% ≈ 25.9%
+  //   → primeCost% ≈ 56.1% (status 'good')
+  //
+  // Estos records son Sale.status='issued' con issuedAt dentro de lastMonthPeriod,
+  // que es exactamente lo que unitsSoldByDish() filtra. Son registros REALES
+  // (Order → OrderItem → Sale → Payment), no entradas de salesHistory.
+  {
+    let lastMonthSalesCount = 0;
+    let lastMonthRevenue = new Prisma.Decimal(0);
+
+    for (let day = 1; day <= daysInLastMonth; day++) {
+      // Lima midnight for this day = Date.UTC with 0-indexed month (lastMonthNum-1)
+      // at 05:00 UTC (Lima is UTC-5, so 00:00 Lima = 05:00 UTC).
+      const dayStart = new Date(
+        Date.UTC(lastMonthYear, lastMonthNum - 1, day, 5, 0, 0),
+      );
+      // Weekend boost: sábados/domingos venden ~20% más (realismo estacional).
+      const dow = new Date(
+        dayStart.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE,
+      ).getUTCDay();
+      const isWeekend = dow === 0 || dow === 6;
+      const dailyCount = isWeekend ? randInt(18, 22) : randInt(14, 18);
+
+      for (let i = 0; i < dailyCount; i++) {
+        // Horario realista de restaurante: mediodía–medianoche Lima.
+        const hour = randInt(12, 23);
+        const minute = randInt(0, 59);
+        const issuedAt = atLimaTime(dayStart, hour, minute);
+        const docType: 'boleta' | 'factura' =
+          rnd() > 0.88 ? 'factura' : 'boleta';
+        const methods: (typeof PAYMENT_METHODS)[number][] = [
+          pick(PAYMENT_METHODS),
+        ];
+        const total = await emitSale({
+          issuedAt,
+          tableId: pick(tableIds),
+          docType,
+          lines: buildLines(),
+          methods,
+        });
+        lastMonthSalesCount++;
+        lastMonthRevenue = lastMonthRevenue.add(total);
+      }
+    }
+    console.log(
+      `  ✓ ${lastMonthSalesCount} ventas del mes anterior (${lastMonthPeriod}, ` +
+        `S/ ${lastMonthRevenue.toFixed(2)})`,
+    );
+  }
+
   // 9) Órdenes "vivas" (cuentas abiertas) en las mesas ocupadas, SIN Sale.
   // Tiempos realistas relativos a AHORA para que el mapa muestre una MEZCLA de
   // estados (no un mar de "demorada"): mesas recién sentadas, una demorada (>2h)
@@ -1436,7 +1775,7 @@ async function main(): Promise<void> {
     const lines = buildLines();
     const sentAt = sc.status === 'open' ? null : openedAt;
     for (let li = 0; li < lines.length; li++) {
-      const l = lines[li]!;
+      const l = lines[li];
       // En una comanda recién enviada, la cocina no arrancó todo: el primer ítem
       // queda "en cola" (pending) y el resto "en preparación" → el KDS muestra
       // ambos estados de forma realista.

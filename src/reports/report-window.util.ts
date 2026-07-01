@@ -72,3 +72,22 @@ export function lastNLimaDays(days: number, now: Date = new Date()): string[] {
   }
   return keys;
 }
+
+/**
+ * Returns the last complete calendar month as a `YYYY-MM` period string,
+ * computed in the Lima timezone (UTC-5, no DST).
+ *
+ * Used as the default period for analytics endpoints (menu engineering, prime
+ * cost, costing) that require a full month of data to be meaningful.
+ * If `now` is 2026-07-01T05:00:00Z (= 2026-07-01 00:00 Lima), returns '2026-06'.
+ */
+export function lastCompletePeriod(now: Date = new Date()): string {
+  // Shift to Lima local time before extracting year/month to avoid off-by-one
+  // at month boundaries (e.g. UTC midnight Jan 1 = Dec 31 Lima time).
+  const local = new Date(now.getTime() + LIMA_OFFSET_MINUTES * MS_PER_MINUTE);
+  const year = local.getUTCFullYear();
+  const month = local.getUTCMonth() + 1; // 1-indexed
+  const prevMonth = month === 1 ? 12 : month - 1;
+  const prevYear = month === 1 ? year - 1 : year;
+  return `${prevYear}-${String(prevMonth).padStart(2, '0')}`;
+}

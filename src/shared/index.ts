@@ -24,6 +24,7 @@ export * from './costing/costing';
 export * from './reports/report';
 export * from './notifications/notification';
 export * from './ingestion/sales-history';
+export * from './ingestion/import-document';
 export * from './forecasting/forecast';
 export * from './forecasting/shopping-suggestions';
 export * from './chat/chat';

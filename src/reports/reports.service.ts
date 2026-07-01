@@ -4,12 +4,20 @@ import { PrismaService } from '../platform/prisma/prisma.service';
 import { RecipesService } from '../catalog/recipes.service';
 import { type SalesGroupBy } from '../shared';
 import {
+  lastCompletePeriod,
   lastNLimaDays,
   limaDayKey,
   limaDayStart,
   resolveWindow,
   type DateWindow,
 } from './report-window.util';
+import {
+  classifyDish,
+  POPULARITY_FACTOR,
+  recommendationFor,
+  type MenuEngClassification,
+  type MenuEngRecommendation,
+} from './menu-engineering.util';
 
 type Tx = Prisma.TransactionClient;
 type SaleRow = Prisma.SaleGetPayload<object>;
@@ -43,6 +51,112 @@ const TARGET_FOOD_COST_PCT = new Prisma.Decimal(30);
 
 // HU-07-07 · Etiqueta para mermas sin razón registrada (agrupación de byReason).
 const NO_REASON_LABEL = 'sin razón';
+
+// --- HU-07-11 · Menu Engineering types (re-exported for the controller) ---
+export type { MenuEngClassification, MenuEngRecommendation };
+
+// HU-07-11 · Per-item output of the menu engineering analysis.
+export interface MenuEngineeringItem {
+  menuItemId: string;
+  name: string;
+  /** Name of the menu category, or undefined if the item has no category. */
+  category?: string;
+  unitsSold: number;
+  /** Sale price (PEN string). */
+  price: string;
+  /** Ingredient cost per unit via recursive BOM (PEN string). Does NOT include CIF. */
+  foodCost: string;
+  /** price − foodCost (PEN string). */
+  contributionMargin: string;
+  /** contributionMargin × unitsSold (PEN string). */
+  totalContribution: string;
+  /** unitsSold / totalUnits in the period (4 decimal places). */
+  popularityShare: string;
+  classification: MenuEngClassification;
+  recommendation: MenuEngRecommendation;
+}
+
+// HU-07-11 · Full menu engineering report for a period.
+export interface MenuEngineeringReport {
+  period: string;
+  /** 0.70 × (1/N), 4 decimal places. The minimum popularityShare for "high popularity". */
+  popularityCutoff: string;
+  /** Simple (unweighted) average contribution margin across all N items (PEN string). */
+  avgContributionMargin: string;
+  items: MenuEngineeringItem[];
+}
+
+// --- HU-07-12 · Prime Cost types ---
+export type PrimeCostStatus = 'good' | 'warning' | 'high';
+
+// HU-07-12 · Prime Cost report for a period.
+export interface PrimeCostReport {
+  period: string;
+  /** Σ Sale.total (issued, includes IGV) — consistent revenue basis with all other reports. */
+  revenue: string;
+  /** Σ (unitsSold × ingredientCost) per active dish (theoretical food cost, PEN string). */
+  foodCost: string;
+  /** foodCost / revenue × 100. */
+  foodCostPct: string;
+  /** Σ overhead_costs.amount WHERE concept ILIKE '%sueld%' for the period (PEN string). */
+  laborCost: string;
+  /** laborCost / revenue × 100. */
+  laborCostPct: string;
+  /** foodCost + laborCost (PEN string). */
+  primeCost: string;
+  /** primeCost / revenue × 100. */
+  primeCostPct: string;
+  /** good (≤60%) | warning (60–65%) | high (>65%). Industry benchmark: 55–65% healthy. */
+  status: PrimeCostStatus;
+  /** Benchmark bounds for UI gauge/semáforo rendering. */
+  benchmarks: {
+    primeCostGoodMax: string;
+    primeCostWarningMax: string;
+    foodCostGoodMin: string;
+    foodCostGoodMax: string;
+    laborCostGoodMin: string;
+    laborCostGoodMax: string;
+    foodCostStatus: PrimeCostStatus;
+    laborCostStatus: PrimeCostStatus;
+  };
+}
+
+// HU-07-12 · Industry benchmark thresholds (PEN restaurant standards).
+// Prime cost: ≤60% good, 60–65% warning, >65% high.
+const PRIME_COST_GOOD_MAX = new Prisma.Decimal(60);
+const PRIME_COST_WARNING_MAX = new Prisma.Decimal(65);
+// Food cost: 28–35% healthy; ≤35% good, ≤40% warning, >40% high.
+const FOOD_COST_GOOD_MIN = new Prisma.Decimal(28);
+const FOOD_COST_GOOD_MAX = new Prisma.Decimal(35);
+const FOOD_COST_WARNING_MAX = new Prisma.Decimal(40);
+// Labor cost: 25–35% healthy; same thresholds as food cost.
+const LABOR_COST_GOOD_MIN = new Prisma.Decimal(25);
+const LABOR_COST_GOOD_MAX = new Prisma.Decimal(35);
+const LABOR_COST_WARNING_MAX = new Prisma.Decimal(40);
+
+/**
+ * Prime cost status thresholds (≤60 good, ≤65 warning, >65 high).
+ * Revenue=0 case: pct will be 0, which maps to 'good' (no activity).
+ */
+function primeCostStatusFor(pct: Prisma.Decimal): PrimeCostStatus {
+  if (pct.lte(PRIME_COST_GOOD_MAX)) return 'good';
+  if (pct.lte(PRIME_COST_WARNING_MAX)) return 'warning';
+  return 'high';
+}
+
+/**
+ * Generic component cost status (food or labor):
+ *   ≤ goodMax → 'good'; ≤ warningMax → 'warning'; else 'high'.
+ */
+function componentCostStatusFor(
+  pct: Prisma.Decimal,
+  goodMax: Prisma.Decimal,
+  warningMax: Prisma.Decimal,
+): PrimeCostStatus {
+  if (pct.lte(goodMax)) return 'good';
+  if (pct.lte(warningMax)) return 'warning';
+  return 'high';
+}
 
 /** Clasifica el stock frente al mínimo: critical ≤ min·0.5; low < min; si no ok. */
 function statusFor(
@@ -644,6 +758,226 @@ export class ReportsService {
           }))
           .sort((a, b) => Number(b.cost) - Number(a.cost)),
         movements,
+      };
+    });
+  }
+
+  /**
+   * HU-07-11 · Menu Engineering (Kasavana-Smith matrix) for a period.
+   *
+   * For each active menu item computes:
+   *   - `foodCost` = ingredient cost per unit (BOM recursive, via RecipesService).
+   *     NOTE: does NOT include CIF — menu engineering uses the direct contribution
+   *     margin (price − ingredient cost), not the full cost with overhead allocation.
+   *   - `contributionMargin` = price − foodCost.
+   *   - `popularityShare` = unitsSold / totalUnits.
+   *   - `popularityCutoff` = 0.70 × (1/N) (Kasavana-Smith standard).
+   *   - `avgContributionMargin` = simple (unweighted) average CM across all N items.
+   *
+   * Tenant isolation: `tenant_id` from JWT; all reads inside `runInTenant`.
+   * CASL: `read Report` (owner/manager; staff → 403).
+   */
+  async menuEngineering(
+    tenantId: string,
+    period?: string,
+  ): Promise<MenuEngineeringReport> {
+    const resolvedPeriod = period ?? lastCompletePeriod();
+    return this.prisma.runInTenant(tenantId, async (tx) => {
+      const unitsByDish = await this.unitsSoldByDish(tx, resolvedPeriod);
+      const menuItems = await tx.menuItem.findMany({
+        where: { deletedAt: null, isActive: true },
+        include: { menuCategory: { select: { name: true } } },
+        orderBy: { name: 'asc' },
+      });
+
+      const n = menuItems.length;
+
+      if (n === 0) {
+        return {
+          period: resolvedPeriod,
+          popularityCutoff: '0.0000',
+          avgContributionMargin: '0.00',
+          items: [],
+        };
+      }
+
+      // Popularity cutoff for this analysis: 70% of the "fair share" (1/N).
+      // An item must reach at least this fraction of total units to be "popular".
+      const popularityCutoff = POPULARITY_FACTOR.div(n);
+
+      // Pre-compute per-dish data (one BOM lookup per item).
+      const totalUnits = [...unitsByDish.values()].reduce((a, b) => a + b, 0);
+
+      const dishRows: Array<{
+        item: (typeof menuItems)[0];
+        ingredientCost: Prisma.Decimal;
+        unitsSold: number;
+      }> = [];
+
+      for (const item of menuItems) {
+        const ingredientCost = await this.recipes.costPerYieldTx(
+          tx,
+          item.recipeId,
+        );
+        dishRows.push({
+          item,
+          ingredientCost,
+          unitsSold: unitsByDish.get(item.id) ?? 0,
+        });
+      }
+
+      // Simple (unweighted) average contribution margin — Kasavana-Smith uses the
+      // arithmetic mean of CM across items, not weighted by units sold.  The weighting
+      // is already captured by `popularityShare`; the CM cutoff measures inherent
+      // margin potential independent of volume.
+      const sumCM = dishRows.reduce(
+        (sum, { item, ingredientCost }) =>
+          sum.add(item.price.sub(ingredientCost)),
+        new Prisma.Decimal(0),
+      );
+      const avgContributionMargin = sumCM.div(n);
+
+      const items: MenuEngineeringItem[] = dishRows.map(
+        ({ item, ingredientCost, unitsSold }) => {
+          const price = item.price;
+          const contributionMargin = price.sub(ingredientCost);
+          const totalContribution = contributionMargin.mul(unitsSold);
+          const popularityShare =
+            totalUnits > 0
+              ? new Prisma.Decimal(unitsSold).div(totalUnits)
+              : new Prisma.Decimal(0);
+          const classification = classifyDish(
+            popularityShare,
+            popularityCutoff,
+            contributionMargin,
+            avgContributionMargin,
+          );
+          return {
+            menuItemId: item.id,
+            name: item.name,
+            // category is optional: only present when the item belongs to a MenuCategory.
+            ...(item.menuCategory ? { category: item.menuCategory.name } : {}),
+            unitsSold,
+            price: price.toFixed(2),
+            foodCost: ingredientCost.toFixed(2),
+            contributionMargin: contributionMargin.toFixed(2),
+            totalContribution: totalContribution.toFixed(2),
+            popularityShare: popularityShare.toFixed(4),
+            classification,
+            recommendation: recommendationFor(classification),
+          };
+        },
+      );
+
+      return {
+        period: resolvedPeriod,
+        popularityCutoff: popularityCutoff.toFixed(4),
+        avgContributionMargin: avgContributionMargin.toFixed(2),
+        items,
+      };
+    });
+  }
+
+  /**
+   * HU-07-12 · Prime Cost — the #1 restaurant KPI: (food + labor) / revenue.
+   *
+   * Revenue base: `Σ Sale.total` (includes IGV, same basis as all other report
+   * revenue figures). If excluding IGV is needed in the future, switch to `subtotal`.
+   *
+   * Labor identification: overhead_costs WHERE concept ILIKE '%sueld%'. Naming
+   * convention enforced by the tenant setup: the "Sueldos de planilla" line is the
+   * only labor overhead. All other lines are non-labor overhead (rent, utilities…).
+   *
+   * Tenant isolation: `tenant_id` from JWT; all reads inside `runInTenant`.
+   * CASL: `read Report` (owner/manager; staff → 403).
+   */
+  async primeCost(tenantId: string, period?: string): Promise<PrimeCostReport> {
+    const resolvedPeriod = period ?? lastCompletePeriod();
+    const { start, end } = monthRange(resolvedPeriod);
+
+    return this.prisma.runInTenant(tenantId, async (tx) => {
+      // --- Revenue ---
+      const salesRows = await tx.sale.findMany({
+        where: { status: 'issued', issuedAt: { gte: start, lt: end } },
+        select: { total: true },
+      });
+      const revenue = salesRows.reduce(
+        (sum, s) => sum.add(s.total),
+        new Prisma.Decimal(0),
+      );
+
+      // --- Food cost (theoretical: BOM × units sold) ---
+      // Replicates CostingService logic without importing across module boundaries.
+      const unitsByDish = await this.unitsSoldByDish(tx, resolvedPeriod);
+      const menuItems = await tx.menuItem.findMany({
+        where: { deletedAt: null, isActive: true },
+        select: { id: true, recipeId: true },
+      });
+      let foodCost = new Prisma.Decimal(0);
+      for (const item of menuItems) {
+        const unitsSold = unitsByDish.get(item.id) ?? 0;
+        if (unitsSold === 0) continue;
+        const ingredientCost = await this.recipes.costPerYieldTx(
+          tx,
+          item.recipeId,
+        );
+        foodCost = foodCost.add(ingredientCost.mul(unitsSold));
+      }
+
+      // --- Labor cost (overhead lines matching the 'Sueldos de planilla' convention) ---
+      const laborRows = await tx.overheadCost.findMany({
+        where: {
+          period: resolvedPeriod,
+          deletedAt: null,
+          concept: { contains: 'sueld', mode: 'insensitive' },
+        },
+        select: { amount: true },
+      });
+      const laborCost = laborRows.reduce(
+        (sum, r) => sum.add(r.amount),
+        new Prisma.Decimal(0),
+      );
+
+      const primeCost = foodCost.add(laborCost);
+
+      // Compute percentage: guard against zero revenue.
+      const pct = (value: Prisma.Decimal): Prisma.Decimal =>
+        revenue.isZero()
+          ? new Prisma.Decimal(0)
+          : value.div(revenue).mul(HUNDRED);
+
+      const foodCostPct = pct(foodCost);
+      const laborCostPct = pct(laborCost);
+      const primeCostPctVal = pct(primeCost);
+
+      return {
+        period: resolvedPeriod,
+        revenue: revenue.toFixed(2),
+        foodCost: foodCost.toFixed(2),
+        foodCostPct: foodCostPct.toFixed(2),
+        laborCost: laborCost.toFixed(2),
+        laborCostPct: laborCostPct.toFixed(2),
+        primeCost: primeCost.toFixed(2),
+        primeCostPct: primeCostPctVal.toFixed(2),
+        status: primeCostStatusFor(primeCostPctVal),
+        benchmarks: {
+          primeCostGoodMax: PRIME_COST_GOOD_MAX.toFixed(2),
+          primeCostWarningMax: PRIME_COST_WARNING_MAX.toFixed(2),
+          foodCostGoodMin: FOOD_COST_GOOD_MIN.toFixed(2),
+          foodCostGoodMax: FOOD_COST_GOOD_MAX.toFixed(2),
+          laborCostGoodMin: LABOR_COST_GOOD_MIN.toFixed(2),
+          laborCostGoodMax: LABOR_COST_GOOD_MAX.toFixed(2),
+          foodCostStatus: componentCostStatusFor(
+            foodCostPct,
+            FOOD_COST_GOOD_MAX,
+            FOOD_COST_WARNING_MAX,
+          ),
+          laborCostStatus: componentCostStatusFor(
+            laborCostPct,
+            LABOR_COST_GOOD_MAX,
+            LABOR_COST_WARNING_MAX,
+          ),
+        },
       };
     });
   }

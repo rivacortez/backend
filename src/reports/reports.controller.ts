@@ -8,7 +8,9 @@ import { ZodValidationPipe } from '../common/zod-validation.pipe';
 import {
   foodCostReportQuerySchema,
   inventoryReportQuerySchema,
+  menuEngineeringQuerySchema,
   ok,
+  primeCostQuerySchema,
   reportWindowQuerySchema,
   salesReportQuerySchema,
   wasteReportQuerySchema,
@@ -16,6 +18,8 @@ import {
   type FoodCostReportQueryInput,
   type InventoryReportQueryInput,
   type JwtClaims,
+  type MenuEngineeringQueryInput,
+  type PrimeCostQueryInput,
   type ReportWindowQueryInput,
   type SalesReportQueryInput,
   type WasteReportQueryInput,
@@ -29,7 +33,9 @@ import {
   type FoodCostReport,
   type InventoryReport,
   type ManagerDashboard,
+  type MenuEngineeringReport,
   type ParetoReport,
+  type PrimeCostReport,
   type SalesReport,
   type WasteReport,
 } from './reports.service';
@@ -234,6 +240,48 @@ export class ReportsController {
       );
     }
     return ok(report);
+  }
+
+  /**
+   * HU-07-11 · Menu Engineering (Kasavana-Smith matrix) — `GET /api/reports/menu-engineering`.
+   *
+   * Classifies every active menu item into star/plowhorse/puzzle/dog using:
+   *   - popularity = unitsSold share vs 70%-of-fair-share cutoff;
+   *   - profitability = contribution margin (price − foodCost) vs simple avg CM.
+   *
+   * `?period=YYYY-MM` optional; defaults to last complete month (America/Lima).
+   * `read Report` gate → owner/manager only; staff → 403.
+   */
+  @Get('menu-engineering')
+  @RequireAbility('read', 'Report')
+  async menuEngineering(
+    @CurrentUser() claims: JwtClaims,
+    @Query(new ZodValidationPipe(menuEngineeringQuerySchema))
+    query: MenuEngineeringQueryInput,
+  ): Promise<ApiResponse<MenuEngineeringReport>> {
+    return ok(
+      await this.reports.menuEngineering(claims.tenant_id, query.period),
+    );
+  }
+
+  /**
+   * HU-07-12 · Prime Cost — `GET /api/reports/prime-cost`.
+   *
+   * Returns (food + labor) as % of revenue with industry-benchmark semáforo.
+   * Revenue = Σ Sale.total (includes IGV, consistent with all report revenue figures).
+   * Labor = overhead_costs WHERE concept ILIKE '%sueld%' (Sueldos de planilla convention).
+   *
+   * `?period=YYYY-MM` optional; defaults to last complete month (America/Lima).
+   * `read Report` gate → owner/manager only; staff → 403.
+   */
+  @Get('prime-cost')
+  @RequireAbility('read', 'Report')
+  async primeCost(
+    @CurrentUser() claims: JwtClaims,
+    @Query(new ZodValidationPipe(primeCostQuerySchema))
+    query: PrimeCostQueryInput,
+  ): Promise<ApiResponse<PrimeCostReport>> {
+    return ok(await this.reports.primeCost(claims.tenant_id, query.period));
   }
 
   /**

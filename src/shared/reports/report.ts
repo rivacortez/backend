@@ -58,3 +58,18 @@ export const wasteReportQuerySchema = reportWindowQuerySchema.extend({
   format: reportFormatSchema.optional(),
 });
 export type WasteReportQueryInput = z.infer<typeof wasteReportQuerySchema>;
+
+// HU-07-11 · Query del Menu Engineering: período opcional (default = último mes
+// completo en America/Lima, coherente con el default del costeo).
+export const menuEngineeringQuerySchema = z.object({
+  period: periodSchema.optional(),
+});
+export type MenuEngineeringQueryInput = z.infer<
+  typeof menuEngineeringQuerySchema
+>;
+
+// HU-07-12 · Query del Prime Cost: período opcional (mismo default que HU-07-11).
+export const primeCostQuerySchema = z.object({
+  period: periodSchema.optional(),
+});
+export type PrimeCostQueryInput = z.infer<typeof primeCostQuerySchema>;
