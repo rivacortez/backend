@@ -30,6 +30,7 @@ import {
   IngredientsImportService,
   type ImportReport,
 } from './ingredients-import.service';
+import { RecipesService, type RecipeUsageView } from './recipes.service';
 
 @Controller('ingredients')
 @UseGuards(JwtAuthGuard, PoliciesGuard)
@@ -37,6 +38,7 @@ export class IngredientsController {
   constructor(
     private readonly ingredients: IngredientsService,
     private readonly importer: IngredientsImportService,
+    private readonly recipes: RecipesService,
   ) {}
 
   @Get()
@@ -54,6 +56,19 @@ export class IngredientsController {
     @Param('id') id: string,
   ): Promise<ApiResponse<IngredientView>> {
     return ok(await this.ingredients.get(claims.tenant_id, id));
+  }
+
+  /**
+   * QA-06 (bugfix) · Reverse-lookup: recetas que usan este insumo (panel
+   * "Usado en (N recetas)" del detalle de insumo).
+   */
+  @Get(':id/recipes')
+  @RequireAbility('read', 'Catalog')
+  async usedInRecipes(
+    @CurrentUser() claims: JwtClaims,
+    @Param('id') id: string,
+  ): Promise<ApiResponse<RecipeUsageView[]>> {
+    return ok(await this.recipes.usedByIngredient(claims.tenant_id, id));
   }
 
   @Post()

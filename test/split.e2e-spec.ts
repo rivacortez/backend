@@ -42,6 +42,16 @@ describe('Split — división de cuenta por comensal HU-04-03 (e2e)', () => {
     z.object({
       orderId: z.uuid(),
       mode: z.string(),
+      // QA-02 (bugfix) · aditivo — bruto + descuento vigente (null si no hay).
+      grossTotal: z.string(),
+      discount: z
+        .object({
+          type: z.string(),
+          value: z.string(),
+          reason: z.string(),
+          amount: z.string(),
+        })
+        .nullable(),
       shares: z.array(splitShare),
       total: z.string(),
     }),
@@ -287,5 +297,64 @@ describe('Split — división de cuenta por comensal HU-04-03 (e2e)', () => {
       staffToken,
       { mode: 'equal', parts: 2 },
     ).expect(404);
+  });
+
+  // QA-02 (bugfix) · root cause: "Dividir por persona" repartía el BRUTO
+  // (Σ unitPrice·qty) ignorando el descuento aplicado en el modal — el QA
+  // reportó que la cuenta con 10% off (104 → 93.60) seguía dividiendo 104.
+  it('QA-02: equal con 10% de descuento divide el TOTAL YA descontado (90.00)', async () => {
+    const { orderId } = await openOrderWith2Items(); // 60+40 = 100
+    await post(`/api/orders/${orderId}/discount`, ownerToken, {
+      type: 'pct',
+      value: 10,
+      reason: 'Cliente frecuente',
+    }).expect(201);
+    const split = splitSchema.parse(
+      (
+        await post(`/api/orders/${orderId}/split`, staffToken, {
+          mode: 'equal',
+          parts: 2,
+        }).expect(201)
+      ).body,
+    ).data;
+    expect(split.grossTotal).toBe('100.00');
+    expect(split.discount).toEqual({
+      type: 'pct',
+      value: '10.00',
+      reason: 'Cliente frecuente',
+      amount: '10.00',
+    });
+    expect(split.total).toBe('90.00'); // 100 - 10% = 90, NO 100
+    expect(split.shares[0].total).toBe('45.00');
+    expect(split.shares[1].total).toBe('45.00');
+  });
+
+  it('QA-02: items con descuento reparte PROPORCIONAL — Σ shares == total descontado', async () => {
+    const { orderId, itemIdA, itemIdB } = await openOrderWith2Items(); // A=60, B=40
+    await post(`/api/orders/${orderId}/discount`, ownerToken, {
+      type: 'amount',
+      value: 20,
+      reason: 'Promoción del día',
+    }).expect(201);
+    const split = splitSchema.parse(
+      (
+        await post(`/api/orders/${orderId}/split`, staffToken, {
+          mode: 'items',
+          assignments: [
+            { label: 'Ana', itemIds: [itemIdA] },
+            { label: 'Beto', itemIds: [itemIdB] },
+          ],
+        }).expect(201)
+      ).body,
+    ).data;
+    // bruto 100, descuento 20 → total 80. Proporcional: Ana (60/100·80=48),
+    // Beto (40/100·80=32). Σ == 80.00 exacto (invariante del split).
+    expect(split.total).toBe('80.00');
+    const ana = split.shares.find((s) => s.label === 'Ana');
+    const beto = split.shares.find((s) => s.label === 'Beto');
+    expect(ana?.total).toBe('48.00');
+    expect(beto?.total).toBe('32.00');
+    const sum = split.shares.reduce((a, s) => a + Number(s.total), 0);
+    expect(sum).toBeCloseTo(80, 2);
   });
 });

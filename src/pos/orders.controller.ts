@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   ParseUUIDPipe,
@@ -17,6 +18,7 @@ import { RequireAbility } from '../authz/require-ability.decorator';
 import { ZodValidationPipe } from '../common/zod-validation.pipe';
 import {
   addOrderItemsSchema,
+  applyDiscountSchema,
   ok,
   openOrderSchema,
   updateOrderItemSchema,
@@ -24,6 +26,7 @@ import {
   voidOrderSchema,
   type AddOrderItemsInput,
   type ApiResponse,
+  type ApplyDiscountInput,
   type JwtClaims,
   type OpenOrderInput,
   type UpdateOrderItemInput,
@@ -105,6 +108,34 @@ export class OrdersController {
     @Body(new ZodValidationPipe(voidOrderSchema)) dto: VoidOrderInput,
   ): Promise<ApiResponse<OrderView>> {
     return ok(await this.orders.void(claims.tenant_id, id, dto));
+  }
+
+  /**
+   * QA-02 (bugfix) · Aplicar descuento a la cuenta. CASL `update Sale` (manager/
+   * owner; staff → 403) — MISMO criterio que anular ticket (HU-04-07): un
+   * descuento es una decisión financiera, no una operación de mesero/cajero.
+   * Coincide con la UI del frontend (badge "Owner" en el modal de descuento).
+   */
+  @Post(':id/discount')
+  @RequireAbility('update', 'Sale')
+  @Audited('order.apply_discount')
+  async applyDiscount(
+    @CurrentUser() claims: JwtClaims,
+    @Param('id') id: string,
+    @Body(new ZodValidationPipe(applyDiscountSchema)) dto: ApplyDiscountInput,
+  ): Promise<ApiResponse<OrderView>> {
+    return ok(await this.orders.applyDiscount(claims.tenant_id, id, dto));
+  }
+
+  /** QA-02 (bugfix) · Quitar el descuento vigente. Mismo gate que aplicarlo. */
+  @Delete(':id/discount')
+  @RequireAbility('update', 'Sale')
+  @Audited('order.remove_discount')
+  async removeDiscount(
+    @CurrentUser() claims: JwtClaims,
+    @Param('id') id: string,
+  ): Promise<ApiResponse<OrderView>> {
+    return ok(await this.orders.removeDiscount(claims.tenant_id, id));
   }
 
   /**

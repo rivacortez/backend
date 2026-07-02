@@ -38,6 +38,22 @@ export interface RecipeView extends RecipeSummary {
   items: RecipeItemView[];
 }
 
+// QA-06 (bugfix) · Reverse-lookup insumo → recetas que lo usan (BOM directo,
+// sin recursión a sub-recetas: el caso de uso es "qué platos se ven afectados
+// si toca este insumo", y el frontend ya lo resuelve por `ingredientId` directo
+// en cada línea). `recipeTotalCost` viaja junto a `lineCost` para que el cliente
+// derive el "impacto" (share = lineCost/recipeTotalCost) sin una llamada extra.
+export interface RecipeUsageView {
+  recipeId: string;
+  name: string;
+  kind: string;
+  emoji: string | null;
+  qty: string;
+  wasteFactor: string;
+  lineCost: string;
+  recipeTotalCost: string;
+}
+
 @Injectable()
 export class RecipesService {
   constructor(private readonly prisma: PrismaService) {}
@@ -75,6 +91,61 @@ export class RecipesService {
     return this.prisma.runInTenant(tenantId, async (tx) => {
       const recipe = await this.findRecipe(tx, id);
       return this.buildView(tx, recipe);
+    });
+  }
+
+  /**
+   * QA-06 (bugfix) · Recetas que usan un insumo (panel "Usado en (N recetas)"
+   * del detalle de insumo). Root cause del defecto original: `GET /api/recipes`
+   * (listado) devuelve `RecipeSummary` — a propósito SIN `items` (evita cargar
+   * el BOM completo de cada receta solo para listar) — y el frontend construía
+   * el panel filtrando `recipe.items` de esa MISMA respuesta, que siempre viene
+   * vacía; el reverse-lookup insumo→recetas simplemente no existía como
+   * endpoint. Esta consulta resuelve el JOIN directo `recipe_items(ingredientId)
+   * → recipes` (RLS FORCE + `deletedAt: null` en ambas tablas), tenant-scoped.
+   */
+  async usedByIngredient(
+    tenantId: string,
+    ingredientId: string,
+  ): Promise<RecipeUsageView[]> {
+    return this.prisma.runInTenant(tenantId, async (tx) => {
+      const ingredient = await tx.ingredient.findFirst({
+        where: { id: ingredientId, deletedAt: null },
+      });
+      if (!ingredient) {
+        throw new NotFoundException('Insumo no encontrado');
+      }
+      const items = await tx.recipeItem.findMany({
+        where: { ingredientId, recipe: { deletedAt: null } },
+        include: { ingredient: true, recipe: true },
+        orderBy: { recipe: { name: 'asc' } },
+      });
+      const usages: RecipeUsageView[] = [];
+      for (const item of items) {
+        const lineCost = await this.itemCost(
+          tx,
+          item,
+          new Set([item.recipeId]),
+          0,
+        );
+        const recipeTotalCost = await this.recipeCost(
+          tx,
+          item.recipeId,
+          new Set<string>(),
+          0,
+        );
+        usages.push({
+          recipeId: item.recipe.id,
+          name: item.recipe.name,
+          kind: item.recipe.kind,
+          emoji: item.recipe.emoji,
+          qty: item.qty.toString(),
+          wasteFactor: item.wasteFactor.toString(),
+          lineCost: lineCost.toFixed(2),
+          recipeTotalCost: recipeTotalCost.toFixed(2),
+        });
+      }
+      return usages;
     });
   }
 

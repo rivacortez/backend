@@ -132,3 +132,23 @@ Seed tenant + owner/staff + zona/mesa + plato (precio 118). Cobra **2 ventas** c
 - `GET /api/cash-close/preview` posterior → ventana **fresca** (`salesCount=0`, `totalGross="0.00"`).
 - `GET /api/cash-close` → lista con el cierre creado.
 - `POST /api/cash-close` (**staff**) → **403**.
+
+---
+
+## Refinamiento QA-07 (bugfix, reporte QA usuario final pre-demo) — Agregado "HOY" de comprobantes
+
+> **Estado:** 🟢 hecho. Sin nuevo número de HU.
+
+**Root cause:** la card "Hoy" de la pantalla Comprobantes (frontend) sumaba `GET /api/sales` **COMPLETO** (el listado histórico del módulo — correcto para la grilla, que necesita el histórico entero para buscar/filtrar; INCORRECTO para una card etiquetada "Hoy") y lo mostraba como si fuera el turno actual. El QA vio S/144,888 = cierre Z anterior (S/140,026, histórico) + turno actual (S/4,862) mezclados. El **Cierre de Caja** (`/api/cash-close/preview`) ya calculaba correctamente la ventana del turno abierto — el bug era específico de esa card, que nunca llamaba a ningún endpoint con ventana de fecha.
+
+**Endpoint nuevo (`billing` — `BillingController`):**
+- `GET /api/sales/today-summary` · `read Sale`. Calcula el **día calendario en America/Lima** (UTC-5 fijo, sin DST) **server-side** — el cliente NO debe derivar zonas horarias de timestamps UTC. Ventana: `[medianoche Lima de hoy, ahora]`. Solo cuenta ventas `status='issued'` (mismo criterio que `totalGross` del cierre Z — las anuladas no suman ingreso).
+- Respuesta `TodaySalesSummary`: `{ date: "YYYY-MM-DD" (Lima), total, count }`.
+- `src/billing/lima-day.util.ts` (lógica PURA, testeada con casos de cruce de medianoche): NO reutiliza `reports/report-window.util.ts` (cross-module import prohibido, `no-restricted-imports`) — replica el cálculo mínimo dentro de `billing`, mismo criterio ya usado en `ingestion` (ver `HU-11-03`: *"ventana ISO opcional, default 'hoy' Lima — lógica replicada inline para no acoplar `reports`"*).
+- Declarado ANTES de `GET /sales/:id` en el controller (si no, Nest interpretaría el segmento literal `today-summary` como el parámetro `:id`).
+
+### Trazabilidad → test
+- `src/billing/lima-day.util.spec.ts` (5 casos unit): medianoche Lima = 05:00 UTC; cruce exacto (04:59 UTC = día anterior Lima, 05:00 UTC = día nuevo Lima); `limaDayKey` cerca de medianoche.
+- `test/today-summary.e2e-spec.ts` (3 casos e2e): sin ventas → `0.00`; **una venta "de ayer" (`issuedAt` retrocedido 25h) NO se cuenta en "hoy"** — simula exactamente el bug reportado (si el fix fallara, el total incluiría ambas ventas); venta anulada no suma.
+
+**Gap de frontend (fuera de este backend, reportado — NO se tocó `team-frontend`):** la card "Hoy" de `app/pages/app/comprobantes/index.vue` (líneas ~23-33, `issuedTotal`) debe dejar de sumar `sales.value` completo y consumir `GET /api/sales/today-summary` en su lugar (o filtrar `all.value` por el día Lima antes de reducir). Ver sección "Cambios de frontend requeridos" en el reporte de cierre de este ticket.

@@ -29,3 +29,18 @@ Subject **`Catalog`**: owner/manager gestionan, staff lee. `@Audited` en create/
 
 ## Trazabilidad → test
 `test/recipes.e2e-spec.ts`: Aderezo=10.00, Lomo=40.00 (ingrediente+sub); ciclo→400; editar→version 2 + costo 70.00 + snapshot; staff crea→403.
+
+---
+
+## Refinamiento QA-06 (bugfix, reporte QA usuario final pre-demo) — Reverse-lookup insumo→recetas
+
+> **Estado:** 🟢 hecho. Sin nuevo número de HU.
+
+**Root cause:** NO existía un endpoint reverse-lookup insumo→recetas. `GET /api/recipes` (listado) devuelve `RecipeSummary[]` **a propósito SIN `items`** (evita cargar el BOM completo de cada receta solo para poblar un listado — decisión de performance ya vigente en HU-02-07/09). El panel "Usado en (N recetas)" del detalle de insumo (frontend) filtraba `recipe.items` de ESA MISMA respuesta — que siempre viene vacía (el propio BFF del frontend hardcodea `items: []` en el mapeo del listado) — así que el panel mostraba 0 recetas SIEMPRE, sin importar el BOM real (que sí funciona: la venta de Ceviche Mixto descontó Pulpo correctamente, confirmado por el QA).
+
+**Endpoint nuevo (`catalog` — `IngredientsController`, reutiliza `RecipesService` del mismo módulo):**
+- `GET /api/ingredients/:id/recipes` · `read Catalog`. 404 si el insumo no existe/fue borrado (tenant-scoped, RLS FORCE). Resuelve el JOIN directo `recipe_items(ingredientId) → recipes` (`deletedAt: null` en ambas tablas) — **sin recursión a sub-recetas** (caso de uso: "qué platos vendibles se ven afectados si toca este insumo").
+- Respuesta `RecipeUsageView[]`: `{ recipeId, name, kind, emoji, qty, wasteFactor, lineCost, recipeTotalCost }`. `lineCost`/`recipeTotalCost` viajan juntos para que el cliente derive el "impacto" (`share = lineCost/recipeTotalCost`) sin una llamada extra — mismo patrón de impacto que ya calculaba el frontend, ahora con datos reales del backend.
+
+### Trazabilidad → test
+`test/ingredient-recipes.e2e-spec.ts` (4 casos): seed Pulpo usado en "Ceviche Mixto" + "Pulpo al Olivo" (y una receta que NO lo usa, de control) → el endpoint devuelve EXACTAMENTE esas 2; insumo sin uso → `[]`; insumo inexistente → 404.

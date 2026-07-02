@@ -8,6 +8,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../platform/prisma/prisma.service';
 import {
   type AddOrderItemsInput,
+  type ApplyDiscountInput,
   type OpenOrderInput,
   type UpdateOrderItemInput,
   type UpsellSuggestionsResponse,
@@ -29,6 +30,19 @@ const VOIDABLE_STATUSES = new Set(['open', 'sent_to_kitchen', 'served']);
 
 // Estados de una orden "viva" (la cuenta actual de una mesa ocupada).
 const CURRENT_ORDER_STATUSES = ['open', 'sent_to_kitchen', 'served'];
+
+// QA-02 (bugfix) · Estados sobre los que se puede aplicar/quitar un descuento:
+// la cuenta debe seguir "viva" (no cobrada ni anulada) — mismo criterio que
+// anular orden. Cobrar (`pay`) es lo que congela el descuento en el ticket.
+const DISCOUNTABLE_STATUSES = new Set(['open', 'sent_to_kitchen', 'served']);
+
+// Vista del descuento vigente en la orden (display; el cómputo monetario
+// autoritativo vive en `computeDiscountAmount`, usado por billing al cobrar).
+export interface OrderDiscountView {
+  type: 'pct' | 'amount';
+  value: string;
+  reason: string;
+}
 
 // Resumen de la orden actual de una mesa (para enriquecer el listado de mesas).
 export interface TableOrderSummary {
@@ -60,6 +74,8 @@ export interface OrderView {
   openedAt: string;
   items: OrderItemView[];
   subtotal: string;
+  // QA-02 (bugfix) · Descuento vigente en la cuenta (null si no se aplicó).
+  discount: OrderDiscountView | null;
 }
 
 function itemToView(item: OrderItemRow): OrderItemView {
@@ -94,6 +110,25 @@ function toView(
     openedAt: order.openedAt.toISOString(),
     items: items.map(itemToView),
     subtotal: subtotal.toFixed(2),
+    discount: toDiscountView(order),
+  };
+}
+
+// QA-02 (bugfix) · Traduce las columnas crudas de descuento a la vista pública.
+// Las 3 columnas viven juntas (null↔no-null en conjunto, garantizado por
+// `applyDiscount`/`removeDiscount`, únicos escritores) — si por algún motivo
+// quedaran parcialmente pobladas, se trata como "sin descuento" (fail-safe).
+function toDiscountView(order: OrderRow): OrderDiscountView | null {
+  if (order.discountType !== 'pct' && order.discountType !== 'amount') {
+    return null;
+  }
+  if (order.discountValue === null || order.discountReason === null) {
+    return null;
+  }
+  return {
+    type: order.discountType,
+    value: order.discountValue.toFixed(2),
+    reason: order.discountReason,
   };
 }
 
@@ -437,6 +472,108 @@ export class OrdersService {
       });
       return this.buildView(tx, updated);
     });
+  }
+
+  /**
+   * QA-02 (bugfix) · Aplica (o reemplaza) el descuento de la cuenta. Root cause
+   * del defecto original: el frontend calculaba el descuento SOLO en el modal
+   * (preview local) y nunca lo enviaba al backend — el cobro salía por el 100%
+   * del importe. Este endpoint persiste la intención de descuento en la orden;
+   * `BillingService` es quien lo aplica de verdad a los totales al cobrar
+   * (`computeDiscountAmount`), así el ticket y el desglose de IGV quedan
+   * consistentes con lo que el mesero/dueño aprobó en el POS.
+   *
+   * Reglas: la cuenta debe seguir viva (no `paid`/`void` → si no, 409). Para
+   * `type='amount'`, el valor NO puede exceder el bruto actual de la orden
+   * (Σ unitPrice·qty de los ítems vivos) → 400 si excede (mismo criterio que
+   * validó el modal del frontend, pero AHORA como fuente de verdad server-side).
+   * `type='pct'` ya viene acotado 0-100 por el DTO (Zod).
+   */
+  async applyDiscount(
+    tenantId: string,
+    id: string,
+    dto: ApplyDiscountInput,
+  ): Promise<OrderView> {
+    return this.prisma.runInTenant(tenantId, async (tx) => {
+      const order = await this.find(tx, id);
+      if (!DISCOUNTABLE_STATUSES.has(order.status)) {
+        throw new ConflictException(
+          'No se puede aplicar un descuento a una cuenta cerrada (cobrada o anulada)',
+        );
+      }
+      if (dto.type === 'amount') {
+        const items = await tx.orderItem.findMany({
+          where: { orderId: order.id, deletedAt: null },
+        });
+        let grossTotal = new Prisma.Decimal(0);
+        for (const item of items) {
+          grossTotal = grossTotal.add(item.unitPrice.mul(item.qty));
+        }
+        if (new Prisma.Decimal(dto.value).greaterThan(grossTotal)) {
+          throw new BadRequestException(
+            'El monto del descuento no puede exceder el total de la cuenta',
+          );
+        }
+      }
+      const updated = await tx.order.update({
+        where: { id: order.id },
+        data: {
+          discountType: dto.type,
+          discountValue: new Prisma.Decimal(dto.value),
+          discountReason: dto.reason,
+        },
+      });
+      return this.buildView(tx, updated);
+    });
+  }
+
+  /** QA-02 (bugfix) · Quita el descuento vigente (vuelve a cobrar el 100%). */
+  async removeDiscount(tenantId: string, id: string): Promise<OrderView> {
+    return this.prisma.runInTenant(tenantId, async (tx) => {
+      const order = await this.find(tx, id);
+      if (!DISCOUNTABLE_STATUSES.has(order.status)) {
+        throw new ConflictException(
+          'No se puede modificar el descuento de una cuenta cerrada (cobrada o anulada)',
+        );
+      }
+      const updated = await tx.order.update({
+        where: { id: order.id },
+        data: {
+          discountType: null,
+          discountValue: null,
+          discountReason: null,
+        },
+      });
+      return this.buildView(tx, updated);
+    });
+  }
+
+  /**
+   * QA-02 (bugfix) · Cómputo AUTORITATIVO del descuento en dinero (PEN), dado el
+   * bruto de la orden (Σ unitPrice·qty de los ítems vivos al momento de cobrar).
+   * Reutilizado por `BillingService` en pre-cuenta/cobro/división — UNA sola
+   * fórmula para que los 3 flujos jamás diverjan:
+   *  - `pct`:    grossTotal · value/100, redondeado a 2 decimales.
+   *  - `amount`: min(value, grossTotal) — nunca deja el total negativo aunque la
+   *    orden haya cambiado (ítems removidos) desde que se aplicó el descuento.
+   *  - sin descuento (`discountType` null) → 0.
+   * Cubre los casos límite del QA: 0% → 0 (cuenta intacta); 100% → grossTotal
+   * completo (cuenta gratis, total final S/0.00).
+   */
+  computeDiscountAmount(
+    order: OrderRow,
+    grossTotal: Prisma.Decimal,
+  ): Prisma.Decimal {
+    if (order.discountType === 'pct' && order.discountValue !== null) {
+      return grossTotal
+        .mul(order.discountValue)
+        .div(100)
+        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+    }
+    if (order.discountType === 'amount' && order.discountValue !== null) {
+      return Prisma.Decimal.min(order.discountValue, grossTotal);
+    }
+    return new Prisma.Decimal(0);
   }
 
   /**

@@ -55,3 +55,22 @@ export const voidOrderSchema = z.object({
   reason: z.string().min(1),
 });
 export type VoidOrderInput = z.infer<typeof voidOrderSchema>;
+
+// QA-02 (bugfix) · Aplicar descuento a la cuenta (orden). `pct`: 0-100 (0 =
+// "descuento aplicado, monto S/0" — caso límite explícito del QA; 100 = cuenta
+// gratis). `amount`: monto PEN >= 0; el tope (no exceder el bruto de la orden)
+// se valida en el servicio porque depende de los ítems vivos, no del DTO.
+// `reason` es OBLIGATORIO (igual que anular orden/ticket — trazabilidad de
+// negocio) y gatillado por CASL `update Sale` (manager/owner; staff → 403,
+// mismo criterio que anular ticket HU-04-07).
+export const applyDiscountSchema = z
+  .object({
+    type: z.enum(['pct', 'amount']),
+    value: z.number().nonnegative(),
+    reason: z.string().min(1),
+  })
+  .refine((v) => v.type !== 'pct' || v.value <= 100, {
+    message: 'El porcentaje de descuento no puede superar 100',
+    path: ['value'],
+  });
+export type ApplyDiscountInput = z.infer<typeof applyDiscountSchema>;

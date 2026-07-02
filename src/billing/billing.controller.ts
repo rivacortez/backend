@@ -24,6 +24,7 @@ import {
   type PreBillView,
   type SaleView,
   type SplitView,
+  type TodaySalesSummary,
 } from './billing.service';
 
 // E04 — Cobros. Las rutas de cobro cuelgan de la orden (orders/:id) y las de
@@ -73,6 +74,17 @@ export class BillingController {
     @CurrentUser() claims: JwtClaims,
   ): Promise<ApiResponse<SaleView[]>> {
     return ok(await this.billing.list(claims.tenant_id));
+  }
+
+  // QA-07 (bugfix) · Agregado "HOY" (día calendario Lima) — declarado ANTES de
+  // `sales/:id` a propósito: si fuera después, Nest interpretaría el segmento
+  // literal `today-summary` como el parámetro `:id` de esa ruta.
+  @Get('sales/today-summary')
+  @RequireAbility('read', 'Sale')
+  async todaySummary(
+    @CurrentUser() claims: JwtClaims,
+  ): Promise<ApiResponse<TodaySalesSummary>> {
+    return ok(await this.billing.todaySummary(claims.tenant_id));
   }
 
   @Get('sales/:id')

@@ -567,6 +567,18 @@ const ZONES = [
   { name: 'Terraza', position: 1 },
 ];
 
+// HU-01-10 · Horarios de atención (bugfix 2026-07-02 — QA scout: la config del
+// local mostraba "Cerrado" todos los días). Restobar-karaoke típico de Lima:
+// cerrado los lunes (día 1), abierto martes(2)–domingo(0) en dos franjas
+// (almuerzo + cena/karaoke). Días 0=domingo..6=sábado (businessHoursSchema,
+// src/shared/tenant/settings.ts). Dos entradas por día porque el schema
+// modela una franja (open/close) por fila, no un rango con corte de almuerzo.
+const OPEN_DAYS = [2, 3, 4, 5, 6, 0] as const; // martes..sábado, domingo
+const BUSINESS_HOURS = OPEN_DAYS.flatMap((day) => [
+  { day, open: '12:00', close: '16:00' }, // almuerzo
+  { day, open: '19:00', close: '23:30' }, // cena + karaoke
+]);
+
 // 10 mesas; 4 'occupied' (alimentan openTables). El resto 'free'.
 type TableSeed = {
   code: string;
@@ -779,6 +791,11 @@ const EMPLOYEES: EmployeeSeed[] = [
 
 const PAYMENT_METHODS = ['cash', 'yape', 'card', 'plin'] as const;
 
+/** Type guard mirroring BillingService.isPaymentMethod (src/billing/billing.service.ts). */
+function isPaymentMethod(m: string): m is (typeof PAYMENT_METHODS)[number] {
+  return (PAYMENT_METHODS as readonly string[]).includes(m);
+}
+
 async function cleanTenant(): Promise<void> {
   // Borra los datos de negocio SOLO de este tenant (orden respetando FKs).
   // Payments/order_items/sale caen por cascade al borrar sale/order, pero somos
@@ -862,7 +879,12 @@ async function main(): Promise<void> {
   const passwordHash = await hash(DEMO_PASSWORD, 10);
   await prisma.tenant.update({
     where: { id: TENANT_ID },
-    data: { name: TENANT_NAME, igvRate: 0.18, currency: 'PEN' },
+    data: {
+      name: TENANT_NAME,
+      igvRate: 0.18,
+      currency: 'PEN',
+      businessHours: BUSINESS_HOURS as unknown as Prisma.InputJsonValue,
+    },
   });
   await prisma.user.update({
     where: { email: USER_EMAIL },
@@ -1742,15 +1764,95 @@ async function main(): Promise<void> {
     );
   }
 
+  // 8d) Cierre Z histórico — bugfix 2026-07-02 (QA scout: "turno zombie" abierto
+  // desde el 1 de junio acumulando S/144,884).
+  //
+  // ROOT CAUSE: BillingService.aggregateOpenWindow() (src/billing/billing.service.ts)
+  // treats the "open shift" window as everything since the LAST cash_closes row
+  // (or all-time if none exists). This seed created real Sale rows spanning the
+  // previous ~37 days (steps 8b + 8c) but never inserted a closing cash_closes
+  // row, so the very first historical sale became the start of a shift that
+  // never closes — exactly the zombie the QA scout found.
+  //
+  // FIX: close that historical window explicitly with ONE immutable cash_closes
+  // row (closedAt = today's Lima midnight), replicating aggregateOpenWindow()'s
+  // exact aggregation (Σ sale.total for issued sales, Σ payment.amount per
+  // method, issued/void counts) so the numbers on the row are internally
+  // consistent with what the app itself would have computed. After this, the
+  // ONLY open shift left is today's (step 8a) — reasonable amounts (~S/1-2k).
+  {
+    const historicalSales = await prisma.sale.findMany({
+      where: { tenantId: TENANT_ID, issuedAt: { lt: today } },
+      include: { payments: true },
+      orderBy: { issuedAt: 'asc' },
+    });
+
+    if (historicalSales.length > 0) {
+      const byMethod: Record<(typeof PAYMENT_METHODS)[number], Prisma.Decimal> =
+        {
+          cash: new Prisma.Decimal(0),
+          card: new Prisma.Decimal(0),
+          yape: new Prisma.Decimal(0),
+          plin: new Prisma.Decimal(0),
+        };
+      let totalGross = new Prisma.Decimal(0);
+      let salesCount = 0;
+      let voidCount = 0;
+      const firstIssuedAt = historicalSales[0].issuedAt;
+
+      for (const sale of historicalSales) {
+        if (sale.status === 'void') {
+          voidCount++;
+          continue;
+        }
+        salesCount++;
+        totalGross = totalGross.add(sale.total);
+        for (const payment of sale.payments) {
+          if (isPaymentMethod(payment.method)) {
+            byMethod[payment.method] = byMethod[payment.method].add(
+              payment.amount,
+            );
+          }
+        }
+      }
+
+      await prisma.cashClose.create({
+        data: {
+          tenantId: TENANT_ID,
+          openedAt: firstIssuedAt,
+          closedAt: today,
+          salesCount,
+          voidCount,
+          totalGross,
+          byMethod: {
+            cash: byMethod.cash.toFixed(2),
+            card: byMethod.card.toFixed(2),
+            yape: byMethod.yape.toFixed(2),
+            plin: byMethod.plin.toFixed(2),
+          } as unknown as Prisma.InputJsonValue,
+        },
+      });
+
+      console.log(
+        `  ✓ cierre Z histórico: ${salesCount} ventas (S/ ${totalGross.toFixed(2)}) ` +
+          `cerradas hasta hoy — el turno abierto actual cubre SOLO hoy`,
+      );
+    }
+  }
+
   // 9) Órdenes "vivas" (cuentas abiertas) en las mesas ocupadas, SIN Sale.
   // Tiempos realistas relativos a AHORA para que el mapa muestre una MEZCLA de
   // estados (no un mar de "demorada"): mesas recién sentadas, una demorada (>2h)
   // y una pidiendo la cuenta (por cobrar). El front marca demorada con umbral 2h.
+  // Bugfix 2026-07-02 (QA scout: mesas "ocupadas" 5-8h atrás inflaban la espera
+  // del KDS a 286 min). Todas las franjas quedan por debajo de 30 min — mezcla
+  // realista de estados operativos SIN disparar el umbral de "demorada" (2h) ni
+  // ninguna espera irreal para una demo en vivo.
   const liveScenarios = [
-    { minutesAgo: 25, status: 'sent_to_kitchen', bill: false }, // recién pidió
-    { minutesAgo: 55, status: 'served', bill: false }, // comiendo
-    { minutesAgo: 165, status: 'served', bill: false }, // demorada (>2h)
-    { minutesAgo: 90, status: 'served', bill: true }, // por cobrar
+    { minutesAgo: 6, status: 'sent_to_kitchen', bill: false }, // recién pidió
+    { minutesAgo: 14, status: 'served', bill: false }, // comiendo
+    { minutesAgo: 22, status: 'served', bill: false }, // terminando
+    { minutesAgo: 27, status: 'served', bill: true }, // por cobrar
   ];
   const itemStatusByOrder: Record<string, string> = {
     open: 'pending',

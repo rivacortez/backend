@@ -13,6 +13,7 @@ import {
   type SplitOrderInput,
   type VoidSaleInput,
 } from '../shared';
+import { limaDayKey, startOfLimaDay } from './lima-day.util';
 
 type Tx = Prisma.TransactionClient;
 type SaleRow = Prisma.SaleGetPayload<object>;
@@ -40,10 +41,24 @@ export interface PreBillItem {
   lineTotal: string;
 }
 
+// QA-02 (bugfix) · Desglose del descuento aplicado (null si la orden no tiene
+// uno vigente). `amount` es el monto YA calculado en PEN (autoritativo, no lo
+// recalcula el cliente) — evita que el frontend repita la aritmética y diverja.
+export interface DiscountBreakdown {
+  type: 'pct' | 'amount';
+  value: string;
+  reason: string;
+  amount: string;
+}
+
 export interface PreBillView {
   orderId: string;
   tableCode: string;
   items: PreBillItem[];
+  // QA-02 (bugfix) · Bruto ANTES de descuento (Σ unitPrice·qty). `subtotal`/
+  // `igv`/`total` de abajo ya son POST-descuento — son los que se cobran.
+  grossTotal: string;
+  discount: DiscountBreakdown | null;
   subtotal: string;
   igv: string;
   total: string;
@@ -69,6 +84,10 @@ export interface SaleView {
   date: string;
   tableLabel: string;
   items: SaleItemView[];
+  // QA-02 (bugfix) · Línea de descuento del comprobante (snapshot inmutable al
+  // momento del cobro — ver `Sale.discount*` en el schema).
+  grossTotal: string;
+  discount: DiscountBreakdown | null;
   subtotal: string;
   igv: string;
   total: string;
@@ -78,7 +97,11 @@ export interface SaleView {
 }
 
 // Totales (con IGV incluido en los precios) calculados desde los ítems vivos.
+// QA-02 (bugfix) · `grossTotal`/`discountAmount` se agregan para que
+// preBill/pay/split compartan LA MISMA aritmética (una sola fuente de verdad).
 interface Totals {
+  grossTotal: Prisma.Decimal;
+  discountAmount: Prisma.Decimal;
   total: Prisma.Decimal;
   subtotal: Prisma.Decimal;
   igv: Prisma.Decimal;
@@ -95,8 +118,23 @@ export interface SplitShare {
 export interface SplitView {
   orderId: string;
   mode: 'equal' | 'items';
+  // QA-02 (bugfix) · Igual que preBill: bruto + descuento vigente, para que el
+  // frontend pueda mostrar "cuenta con descuento" al dividir.
+  grossTotal: string;
+  discount: DiscountBreakdown | null;
   shares: SplitShare[];
   total: string;
+}
+
+// QA-07 (bugfix) · Agregado "HOY" (día calendario en America/Lima, UTC-5) de
+// comprobantes EMITIDOS. `date` = clave del día Lima usada para el corte, útil
+// para que el cliente confirme contra qué ventana está mirando (evita ambigüedad
+// cerca de medianoche). Solo cuenta ventas `status='issued'` — igual criterio
+// que `totalGross` del cierre Z (las anuladas no suman ingreso).
+export interface TodaySalesSummary {
+  date: string; // YYYY-MM-DD (Lima)
+  total: string;
+  count: number;
 }
 
 // HU-04-08 · Totales por método de pago (siempre las 4 claves).
@@ -156,7 +194,7 @@ export class BillingService {
       }
       const items = await this.liveItems(tx, order.id);
       const igvRate = await this.igvRate(tx, tenantId);
-      const totals = this.computeTotals(items, igvRate);
+      const totals = this.computeTotals(order, items, igvRate);
       const table = await tx.diningTable.findFirst({
         where: { id: order.tableId },
       });
@@ -169,6 +207,8 @@ export class BillingService {
           unitPrice: it.unitPrice.toFixed(2),
           lineTotal: it.unitPrice.mul(it.qty).toFixed(2),
         })),
+        grossTotal: totals.grossTotal.toFixed(2),
+        discount: this.discountBreakdown(order, totals.discountAmount),
         subtotal: totals.subtotal.toFixed(2),
         igv: totals.igv.toFixed(2),
         total: totals.total.toFixed(2),
@@ -200,7 +240,7 @@ export class BillingService {
 
       const items = await this.liveItems(tx, order.id);
       const igvRate = await this.igvRate(tx, tenantId);
-      const totals = this.computeTotals(items, igvRate);
+      const totals = this.computeTotals(order, items, igvRate);
 
       const paid = dto.payments.reduce(
         (sum, p) => sum.add(new Prisma.Decimal(p.amount)),
@@ -224,6 +264,12 @@ export class BillingService {
           docType: dto.docType,
           customer: dto.customer ?? null,
           customerDoc: dto.customerDoc ?? null,
+          // QA-02 (bugfix) · Snapshot inmutable del descuento AL MOMENTO DEL
+          // COBRO (el ticket ya no debe mutar si la orden cambiara después).
+          discountType: order.discountType,
+          discountValue: order.discountValue,
+          discountReason: order.discountReason,
+          discountAmount: totals.discountAmount,
           subtotal: totals.subtotal,
           igv: totals.igv,
           total: totals.total,
@@ -282,12 +328,23 @@ export class BillingService {
         throw new BadRequestException('La orden no tiene ítems para dividir');
       }
       const igvRate = await this.igvRate(tx, tenantId);
-      const orderTotal = this.computeTotals(items, igvRate).total;
+      const totals = this.computeTotals(order, items, igvRate);
 
+      // QA-02 (bugfix) · El descuento tiene que sobrevivir a la división —
+      // antes del fix, dividir repartía el BRUTO (Σ unitPrice·qty) ignorando
+      // por completo el descuento aplicado en la orden (root cause del "104
+      // repartidos" del QA). `equal` ya divide `totals.total` (post-descuento).
+      // `items` reparte el descuento PROPORCIONAL al peso bruto de cada parte
+      // (ver `splitByItems`) para que Σ shares.total == totals.total siempre.
       const shareTotals =
         dto.mode === 'equal'
-          ? this.splitEqual(orderTotal, dto.parts ?? order.guests)
-          : this.splitByItems(items, dto.assignments ?? []);
+          ? this.splitEqual(totals.total, dto.parts ?? order.guests)
+          : this.splitByItems(
+              items,
+              dto.assignments ?? [],
+              totals.grossTotal,
+              totals.total,
+            );
 
       const shares = shareTotals.map(({ label, total }) =>
         this.shareFromTotal(label, total, igvRate),
@@ -295,8 +352,10 @@ export class BillingService {
       return {
         orderId: order.id,
         mode: dto.mode,
+        grossTotal: totals.grossTotal.toFixed(2),
+        discount: this.discountBreakdown(order, totals.discountAmount),
         shares,
-        total: orderTotal.toFixed(2),
+        total: totals.total.toFixed(2),
       };
     });
   }
@@ -323,18 +382,27 @@ export class BillingService {
     return result;
   }
 
-  // `items`: cada parte = Σ (unitPrice·qty) de sus ítems. Valida que CADA ítem
-  // vivo de la orden esté asignado exactamente una vez (ni faltante, ni repetido,
-  // ni ajeno) → si no, 400.
+  // `items`: cada parte = Σ (unitPrice·qty) de sus ítems (BRUTO). Valida que
+  // CADA ítem vivo de la orden esté asignado exactamente una vez (ni faltante,
+  // ni repetido, ni ajeno) → si no, 400.
+  //
+  // QA-02 (bugfix) · Sin descuento (`grossTotal == orderTotal`, el caso común)
+  // el share NETO es idéntico al BRUTO — mismo comportamiento exacto de antes
+  // del fix, cero cambio de contrato para las órdenes sin descuento. CON
+  // descuento, reparte el descuento proporcional al peso bruto de cada parte
+  // (redondeo hacia abajo por parte, resto en la PRIMERA — mismo criterio que
+  // `splitEqual`) para garantizar `Σ shares.total === orderTotal` exacto.
   private splitByItems(
     items: OrderItemRow[],
     assignments: { label: string; itemIds: string[] }[],
+    grossTotal: Prisma.Decimal,
+    orderTotal: Prisma.Decimal,
   ): { label: string; total: Prisma.Decimal }[] {
     const byId = new Map(items.map((it) => [it.id, it]));
     const seen = new Set<string>();
-    const result: { label: string; total: Prisma.Decimal }[] = [];
+    const grossShares: { label: string; gross: Prisma.Decimal }[] = [];
     for (const assignment of assignments) {
-      let total = new Prisma.Decimal(0);
+      let gross = new Prisma.Decimal(0);
       for (const itemId of assignment.itemIds) {
         const item = byId.get(itemId);
         if (!item) {
@@ -348,15 +416,40 @@ export class BillingService {
           );
         }
         seen.add(itemId);
-        total = total.add(item.unitPrice.mul(item.qty));
+        gross = gross.add(item.unitPrice.mul(item.qty));
       }
-      result.push({ label: assignment.label, total: total.toDecimalPlaces(2) });
+      grossShares.push({
+        label: assignment.label,
+        gross: gross.toDecimalPlaces(2),
+      });
     }
     if (seen.size !== items.length) {
       throw new BadRequestException(
         'Todos los ítems de la orden deben asignarse exactamente una vez',
       );
     }
+    if (grossTotal.equals(orderTotal) || grossTotal.isZero()) {
+      return grossShares.map((s) => ({ label: s.label, total: s.gross }));
+    }
+    const result: { label: string; total: Prisma.Decimal }[] = new Array(
+      grossShares.length,
+    ) as { label: string; total: Prisma.Decimal }[];
+    let allocatedRest = new Prisma.Decimal(0);
+    for (let i = 1; i < grossShares.length; i++) {
+      const share = grossShares[i];
+      if (!share) continue;
+      const net = share.gross
+        .mul(orderTotal)
+        .div(grossTotal)
+        .toDecimalPlaces(2, Prisma.Decimal.ROUND_DOWN);
+      allocatedRest = allocatedRest.add(net);
+      result[i] = { label: share.label, total: net };
+    }
+    const first = grossShares[0];
+    result[0] = {
+      label: first ? first.label : '',
+      total: orderTotal.sub(allocatedRest),
+    };
     return result;
   }
 
@@ -410,6 +503,36 @@ export class BillingService {
     return this.prisma.runInTenant(tenantId, async (tx) => {
       const sale = await this.findSale(tx, saleId);
       return this.buildSaleView(tx, sale);
+    });
+  }
+
+  /**
+   * QA-07 (bugfix) · Agregado "HOY" de comprobantes emitidos. Root cause del
+   * defecto original: la card "Hoy" de Comprobantes en el frontend sumaba
+   * `GET /api/sales` COMPLETO (ese endpoint es, a propósito, el listado
+   * histórico del módulo — sin ventana de fecha, lo necesita la grilla de
+   * comprobantes) y lo etiquetaba "Hoy", mezclando el acumulado histórico
+   * (S/140,026 del cierre Z anterior) con el turno actual (S/4,862) → el QA vio
+   * S/144,888. Este endpoint calcula la ventana del DÍA CALENDARIO en
+   * America/Lima (00:00 Lima → ahora) server-side — la única fuente confiable
+   * de "hoy" (el cliente no debe derivar zonas horarias de timestamps UTC).
+   */
+  async todaySummary(tenantId: string): Promise<TodaySalesSummary> {
+    return this.prisma.runInTenant(tenantId, async (tx) => {
+      const now = new Date();
+      const from = startOfLimaDay(now);
+      const sales = await tx.sale.findMany({
+        where: { status: 'issued', issuedAt: { gte: from, lte: now } },
+      });
+      let total = new Prisma.Decimal(0);
+      for (const sale of sales) {
+        total = total.add(sale.total);
+      }
+      return {
+        date: limaDayKey(now),
+        total: total.toFixed(2),
+        count: sales.length,
+      };
     });
   }
 
@@ -495,19 +618,60 @@ export class BillingService {
     return tenant.igvRate;
   }
 
-  // Precios INCLUYEN IGV: total = Σ unitPrice·qty; subtotal = total/(1+igvRate);
-  // igv = total − subtotal. Redondeo a 2 decimales (PEN).
-  private computeTotals(items: OrderItemRow[], igvRate: number): Totals {
-    let total = new Prisma.Decimal(0);
+  // Precios INCLUYEN IGV. QA-02 (bugfix) · Único punto de cálculo de totales
+  // usado por preBill/pay/split — antes del fix, el descuento se calculaba SOLO
+  // en el frontend (preview local) y nunca llegaba a esta función, así que el
+  // cobro salía por el bruto completo. Ahora:
+  //   grossTotal = Σ unitPrice·qty (bruto, antes de descuento);
+  //   discountAmount = OrdersService.computeDiscountAmount(order, grossTotal)
+  //     (0 si la orden no tiene descuento vigente — órdenes intactas, sin cambio);
+  //   total = grossTotal − discountAmount (base imponible + IGV YA con el
+  //     descuento aplicado — esto es lo que se cobra y lo que ve el ticket);
+  //   subtotal = total/(1+igvRate); igv = total − subtotal (IGV 18% sobre la
+  //     base YA descontada, no sobre el bruto — la corrección central del defecto).
+  // Redondeo a 2 decimales (PEN) en cada paso.
+  private computeTotals(
+    order: OrderRow,
+    items: OrderItemRow[],
+    igvRate: number,
+  ): Totals {
+    let grossTotal = new Prisma.Decimal(0);
     for (const item of items) {
-      total = total.add(item.unitPrice.mul(item.qty));
+      grossTotal = grossTotal.add(item.unitPrice.mul(item.qty));
     }
-    total = total.toDecimalPlaces(2);
+    grossTotal = grossTotal.toDecimalPlaces(2);
+    const discountAmount = this.orders.computeDiscountAmount(order, grossTotal);
+    const total = grossTotal.sub(discountAmount).toDecimalPlaces(2);
     const subtotal = total
       .div(new Prisma.Decimal(1).add(igvRate))
       .toDecimalPlaces(2);
     const igv = total.sub(subtotal);
-    return { total, subtotal, igv };
+    return { grossTotal, discountAmount, total, subtotal, igv };
+  }
+
+  // QA-02 (bugfix) · Traduce las columnas de descuento (de una Order o de un
+  // Sale ya emitido — ambas comparten los mismos 3 nombres de campo) a la
+  // vista pública, con el monto ya calculado. null = sin descuento vigente.
+  private discountBreakdown(
+    source: {
+      discountType: string | null;
+      discountValue: Prisma.Decimal | null;
+      discountReason: string | null;
+    },
+    discountAmount: Prisma.Decimal,
+  ): DiscountBreakdown | null {
+    if (source.discountType !== 'pct' && source.discountType !== 'amount') {
+      return null;
+    }
+    if (source.discountValue === null || source.discountReason === null) {
+      return null;
+    }
+    return {
+      type: source.discountType,
+      value: source.discountValue.toFixed(2),
+      reason: source.discountReason,
+      amount: discountAmount.toFixed(2),
+    };
   }
 
   // Correlativo: (max number para tenant+serie) + 1; arranca en 1.
@@ -549,6 +713,10 @@ export class BillingService {
         unitPrice: it.unitPrice.toFixed(2),
         total: it.unitPrice.mul(it.qty).toFixed(2),
       })),
+      // QA-02 (bugfix) · Del SNAPSHOT persistido en el Sale (inmutable — no se
+      // recalcula desde la orden, que pudo cambiar después de cobrar).
+      grossTotal: sale.total.add(sale.discountAmount).toFixed(2),
+      discount: this.discountBreakdown(sale, sale.discountAmount),
       subtotal: sale.subtotal.toFixed(2),
       igv: sale.igv.toFixed(2),
       total: sale.total.toFixed(2),
