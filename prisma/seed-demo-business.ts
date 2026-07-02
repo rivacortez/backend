@@ -6,10 +6,13 @@ import { hash } from 'bcryptjs';
  *
  * Puebla el tenant del usuario `rcortezadmin@gmail.com` con un restaurante peruano
  * coherente y CON VIDA: insumos con stock, recetas con BOM, carta de platos, salón
- * con mesas, CIF del mes, histórico de ventas (~6 meses) y, sobre todo, ventas
- * REALES (Order → OrderItem → Sale → Payment) de HOY y de los últimos 7 días para
- * que el dashboard del owner/manager muestre números reales (Venta hoy, tickets,
- * top platos, margen bruto, stock bajo, mesas ocupadas, sparkline 7d).
+ * con mesas, CIF del mes, histórico de ventas SINTÉTICO (18 meses, terminando
+ * AYER — ver el generador documentado en el paso 7 de `main()`, artefacto
+ * metodológico auditable para la tesis, NUNCA presentado como data real) y, sobre
+ * todo, ventas REALES (Order → OrderItem → Sale → Payment) de HOY y de los
+ * últimos 7 días para que el dashboard del owner/manager muestre números reales
+ * (Venta hoy, tickets, top platos, margen bruto, stock bajo, mesas ocupadas,
+ * sparkline 7d).
  *
  * Usa el rol admin (BYPASSRLS) — `DATABASE_URL_ADMIN` (postgres) — porque escribe
  * cross-tenant (igual que prisma/seed.ts y los e2e). Es IDEMPOTENTE: borra primero
@@ -1071,22 +1074,285 @@ async function main(): Promise<void> {
     `  ✓ ${OVERHEADS.length * 2} CIF: períodos ${lastMonthPeriod} + ${period}`,
   );
 
-  // 7) Histórico de ventas (~6 meses+) por plato (sales_history) — para forecasting.
-  // dayBack=187 para superar el umbral FEW_SHOT_MIN_DAYS=180 de sales-aggregation.util.ts
-  // y que el endpoint /forecasting/series devuelva dataQuality='few_shot' o 'good'.
+  // 7) Histórico de ventas SINTÉTICO (sales_history) — GENERADOR PARAMETRIZADO
+  //    (Lote B2 — artefacto metodológico, no "data bonita"). El histórico
+  //    anterior (~6 meses, sin correlación con el calendario peruano) hacía
+  //    que el backtest CON contexto exógeno saliera LEVEMENTE PEOR que sin
+  //    contexto (-0.55%) — la tesis defiende el forecast contextual como su
+  //    aporte central, así que este generador tenía que dejar de ser
+  //    cosmético y pasar a ser un artefacto auditable por el jurado.
+  //
+  // ============================================================================
+  // MODELO GENERATIVO (por plato × día):
+  //
+  //   qty = round( baseQty(plato)
+  //                × weekdayMultiplier(día)   -- estacionalidad semanal
+  //                × eventUplift(día)         -- feriados/eventos gastronómicos
+  //                × paydayUplift(día)        -- quincena / fin de mes
+  //                × (1 + gaussianNoise) )
+  //
+  // - baseQty(plato): igual que antes de este lote — randInt(2,9) escalado
+  //   por la popularidad relativa del plato (DISH_WEIGHTS), para que el
+  //   histórico sea coherente con la mezcla no uniforme de ventas.
+  // - weekdayMultiplier: constantes nombradas en WEEKDAY_MULTIPLIER. Lunes es
+  //   el día más flojo por lejos (coincide con OPEN_DAYS/BUSINESS_HOURS —
+  //   cerrado para walk-ins), pero NO es cero exacto — ver "AJUSTE
+  //   DOCUMENTADO" debajo de la tabla, es una corrección deliberada, no un
+  //   descuido.
+  // - eventUplift/paydayUplift: fechas y nombres copiados TAL CUAL de
+  //   `team-core-ai/app/forecasting/features/calendar.py` (leído SOLO como
+  //   referencia — este archivo no importa/ejecuta Python). Los feriados
+  //   OFICIALES (`holidays.PE`) se excluyen a propósito: el propio docstring
+  //   de `calendar.py` documenta que la mayoría no mueve específicamente la
+  //   demanda de un restaurante; los que sí (Fiestas Patrias, Navidad...) ya
+  //   están en el calendario gastronómico curado de abajo.
+  // - gaussianNoise: Box-Muller con la MISMA PRNG determinista `rnd()` que
+  //   usa el resto de este seed (nunca `Math.random()`) — reproducible:
+  //   correr el seed dos veces el mismo día produce EXACTAMENTE la misma data.
+  //
+  // TRANSPARENCIA (objeción del jurado — "usted diseñó la correlación que
+  // después midió"): cada constante de abajo es NOMBRADA y trae una
+  // justificación de una línea. Ninguna magnitud es caricaturesca (la más
+  // alta es 1.8×, Fiestas Patrias); los feriados de fin de año son una CAÍDA
+  // documentada (las familias cenan en casa), no "todo para arriba" — esa
+  // asimetría es justo lo que hace la simulación defendible. `sales_history`
+  // NUNCA se presenta como data real: este bloque, el docstring de arriba de
+  // este archivo y `specs/e08/HU-08-08-accuracy.spec.md` lo dicen explícito.
+  // ============================================================================
+
+  // --- estacionalidad semanal ---------------------------------------------
+  // Índice = Date#getUTCDay() del día LOCAL Lima (0=dom..6=sáb). Motif es un
+  // restobar-karaoke: almuerzos flojos entre semana, arranca jueves, pico
+  // viernes/sábado noche, domingo almuerzo familiar.
+  //
+  // AJUSTE DOCUMENTADO (Lote B2 — primera corrida real del experimento):
+  // la primera versión de este generador ponía Lunes en `null` (CERRADO,
+  // cero filas — coincide con OPEN_DAYS/BUSINESS_HOURS de más arriba). Al
+  // correr el backtest real (`POST /forecasting/run`) el modelo salía PEOR
+  // que el baseline SeasonalNaive. Investigando la causa: NO era que el
+  // contexto exógeno no ayudara (`model_smape` SÍ salía < `model_smape_no_
+  // context`, la comparativa que le importa a la tesis) — el problema era un
+  // artefacto de la métrica SMAPE (`forecast-validation.util.ts` /
+  // `app/metrics.py`): cuando el real es EXACTAMENTE 0, cualquier predicción
+  // no-exactamente-cero anota el 200% (el máximo posible) sin importar la
+  // magnitud — y LightGBM (a diferencia de SeasonalNaive, que copia el mismo
+  // lunes de la semana anterior y por eso SIEMPRE acierta el 0 exacto) casi
+  // nunca predice un 0.0 literal. Con 2 lunes exactos dentro de un holdout de
+  // 14 días, ese artefacto por sí solo explica gran parte del salto de SMAPE.
+  // Corrección: Lunes pasa a ser el día más flojo por MUCHO (no cero) —
+  // representa actividad residual real y plausible (eventos privados /
+  // catering, el local no recibe público en general) y evita la patología de
+  // la métrica sin inventar una correlación nueva ni tocar los uplifts que
+  // sí son el objeto de estudio.
+  const WEEKDAY_MULTIPLIER: Record<number, number> = {
+    0: 1.15, // domingo — almuerzo familiar
+    1: 0.15, // lunes — sin público general; actividad residual (eventos privados/catering)
+    2: 0.85, // martes — el día más flojo CON público
+    3: 0.9, // miércoles
+    4: 1.05, // jueves — arranca el pull de karaoke
+    5: 1.35, // viernes — noche de karaoke
+    6: 1.45, // sábado — pico de la semana
+  };
+
+  // --- calendario gastronómico (uplift multiplicativo) --------------------
+  // Magnitudes conservadoras, documentadas para el capítulo de metodología —
+  // NO ajustadas a ningún export POS real (Motif no tiene histórico real
+  // mayor a unas semanas en producción).
+  const FIESTAS_PATRIAS_UPLIFT = 1.8; // 28-29 jul — las fechas patrias son, según reportes anecdóticos de restobares limeños, la semana más fuerte del año (asunción conservadora de la simulación).
+  const DIA_DE_LA_MADRE_UPLIFT = 1.6; // 2º domingo de mayo — ampliamente citado como el día más fuerte del año para restaurantes en Perú.
+  const DIA_DEL_CEVICHE_UPLIFT = 1.6; // 28 jun — temáticamente central para una carta de cevichería (Ceviche Clásico/Mixto son "Stars" del menu engineering).
+  const DIA_DEL_PADRE_UPLIFT = 1.3; // 3º domingo de junio — salida familiar, uplift menor que el Día de la Madre.
+  const SAN_VALENTIN_UPLIFT = 1.4; // 14 feb — noche de pareja, encaja con el perfil bar/karaoke del local.
+  const DIA_DEL_PISCO_SOUR_UPLIFT = 1.35; // 2º sábado de febrero — promociones de bar de pisco.
+  const HALLOWEEN_CRIOLLA_UPLIFT = 1.3; // 31 oct — Halloween + Canción Criolla, noche de disfraces/bar.
+  // Feriados de fin de año: CAÍDA documentada (las familias cenan en casa) —
+  // asimetría honesta, no "todo para arriba" (lo que volvería la simulación
+  // caricaturesca).
+  const NOCHEBUENA_DIP = 0.55; // 24 dic — cena familiar en casa.
+  const NAVIDAD_DIP = 0.7; // 25 dic — almuerzo familiar, servicio de noche flojo.
+  const NOCHEVIEJA_DIP = 0.5; // 31 dic — fiestas de casa, no restobares.
+  const ANO_NUEVO_DIP = 0.75; // 1 ene — día de recuperación lento.
+
+  // --- quincena / fin de mes (uplift) --------------------------------------
+  const QUINCENA_DAY = 15;
+  const PAYDAY_WINDOW_RADIUS_DAYS = 1; // mismo radio que calendar.py::_PAYDAY_WINDOW_RADIUS_DAYS
+  const QUINCENA_UPLIFT = 1.15; // día 14-16 — impulso modesto de sueldo quincenal.
+  const FIN_DE_MES_UPLIFT = 1.12; // último día del mes ±1.
+
+  // --- ruido gaussiano ------------------------------------------------------
+  // Desvío estándar relativo del ruido multiplicativo aplicado a cada
+  // plato/día. 12%: suficientemente grande para que un modelo naive
+  // (lag/día-de-semana) no pueda "memorizar" perfectamente la señal de
+  // calendario (lo que volvería sin sentido la comparativa con/sin
+  // contexto), y suficientemente chico para que los multiplicadores de
+  // arriba sigan siendo la señal dominante.
+  const GAUSSIAN_NOISE_STD = 0.12;
+
+  /** N-ésimo día-de-semana del mes (mirror de calendar.py::_nth_weekday_of_month).
+   *  `weekday` sigue la convención de Date#getUTCDay() (0=dom..6=sáb); `n` es 1-based. */
+  function nthWeekdayOfMonth(
+    year: number,
+    monthIdx0: number,
+    weekday: number,
+    n: number,
+  ): { month: number; day: number } {
+    const firstDow = new Date(Date.UTC(year, monthIdx0, 1)).getUTCDay();
+    const daysUntil = (weekday - firstDow + 7) % 7;
+    return { month: monthIdx0, day: 1 + daysUntil + (n - 1) * 7 };
+  }
+
+  type GastroEvent = { uplift: number; label: string };
+
+  /** Calendario gastronómico curado de UN año — fechas/nombres copiados TAL
+   *  CUAL de `team-core-ai/app/forecasting/features/calendar.py::
+   *  _gastro_events_for_year` (referencia de solo lectura). Clave 'MM-DD'
+   *  (el año se resuelve aparte, igual que el resto de este generador). */
+  function gastroEventsForYear(year: number): Map<string, GastroEvent> {
+    const SAT = 6;
+    const SUN = 0;
+    const mmdd = (monthIdx0: number, day: number): string =>
+      `${String(monthIdx0 + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const pisco = nthWeekdayOfMonth(year, 1, SAT, 1); // febrero
+    const madre = nthWeekdayOfMonth(year, 4, SUN, 2); // mayo
+    const padre = nthWeekdayOfMonth(year, 5, SUN, 3); // junio
+    return new Map<string, GastroEvent>([
+      [
+        mmdd(pisco.month, pisco.day),
+        { uplift: DIA_DEL_PISCO_SOUR_UPLIFT, label: 'Día del Pisco Sour' },
+      ],
+      [mmdd(1, 14), { uplift: SAN_VALENTIN_UPLIFT, label: 'San Valentín' }],
+      [
+        mmdd(madre.month, madre.day),
+        { uplift: DIA_DE_LA_MADRE_UPLIFT, label: 'Día de la Madre' },
+      ],
+      [
+        mmdd(padre.month, padre.day),
+        { uplift: DIA_DEL_PADRE_UPLIFT, label: 'Día del Padre' },
+      ],
+      [
+        mmdd(5, 28),
+        { uplift: DIA_DEL_CEVICHE_UPLIFT, label: 'Día del Ceviche' },
+      ],
+      [
+        mmdd(6, 28),
+        { uplift: FIESTAS_PATRIAS_UPLIFT, label: 'Fiestas Patrias' },
+      ],
+      [
+        mmdd(6, 29),
+        { uplift: FIESTAS_PATRIAS_UPLIFT, label: 'Fiestas Patrias' },
+      ],
+      [
+        mmdd(9, 31),
+        {
+          uplift: HALLOWEEN_CRIOLLA_UPLIFT,
+          label: 'Halloween / Día de la Canción Criolla',
+        },
+      ],
+      [mmdd(11, 24), { uplift: NOCHEBUENA_DIP, label: 'Nochebuena' }],
+      [mmdd(11, 25), { uplift: NAVIDAD_DIP, label: 'Navidad' }],
+      [mmdd(11, 31), { uplift: NOCHEVIEJA_DIP, label: 'Nochevieja' }],
+      [mmdd(0, 1), { uplift: ANO_NUEVO_DIP, label: 'Año Nuevo' }],
+    ]);
+  }
+  // Cache por año (el generador recorre 18 meses ⇒ a lo sumo 3 años distintos).
+  const gastroEventsByYear = new Map<number, Map<string, GastroEvent>>();
+  function gastroEventFor(localDay: Date): GastroEvent | undefined {
+    const year = localDay.getUTCFullYear();
+    let events = gastroEventsByYear.get(year);
+    if (!events) {
+      events = gastroEventsForYear(year);
+      gastroEventsByYear.set(year, events);
+    }
+    const mmdd = `${String(localDay.getUTCMonth() + 1).padStart(2, '0')}-${String(localDay.getUTCDate()).padStart(2, '0')}`;
+    return events.get(mmdd);
+  }
+
+  /** Uplift de quincena/fin de mes para un día LOCAL (mirror de
+   *  calendar.py::_merge_payday_window, radio ±1 día). Contempla el fin de
+   *  mes del mes ANTERIOR (p. ej. 31-dic → 1-ene sigue en ventana). */
+  function paydayUplift(localDay: Date): number {
+    const t = localDay.getTime();
+    const y = localDay.getUTCFullYear();
+    const m = localDay.getUTCMonth();
+    const within = (anchorMs: number): boolean =>
+      Math.abs(t - anchorMs) <= PAYDAY_WINDOW_RADIUS_DAYS * MS_PER_DAY;
+    const quincenaAnchor = Date.UTC(y, m, QUINCENA_DAY);
+    const finDeMesAnchor = Date.UTC(y, m + 1, 0); // último día de ESTE mes
+    const finDeMesPrevAnchor = Date.UTC(y, m, 0); // último día del mes ANTERIOR
+    if (within(quincenaAnchor)) return QUINCENA_UPLIFT;
+    if (within(finDeMesAnchor) || within(finDeMesPrevAnchor))
+      return FIN_DE_MES_UPLIFT;
+    return 1;
+  }
+
+  /** Muestra N(0, stdDev) vía Box-Muller, usando la MISMA PRNG determinista
+   *  `rnd()` (nunca Math.random()) — necesario para reproducibilidad exacta. */
+  function gaussianNoise(stdDev: number): number {
+    const u1 = Math.max(rnd(), Number.EPSILON); // evita log(0)
+    const u2 = rnd();
+    const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return z0 * stdDev;
+  }
+
+  /** 'YYYY-MM-DD' de un día LOCAL Lima (mismo shape que target_date/sold_on
+   *  bucketing en `ForecastingService.dailyTotals`). */
+  function limaDateKey(localDay: Date): string {
+    const y = localDay.getUTCFullYear();
+    const m = String(localDay.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(localDay.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
   // Non-uniform history: the average weight per dish is DISH_WEIGHT_TOTAL / N = 10.
   // A dish's baseQty is scaled by (weight/avgWeight) so popular dishes accumulate
   // higher historical sales — matching the real-sales non-uniform mix and producing
   // coherent forecasting shopping suggestions.
   const HIST_AVG_WEIGHT = DISH_WEIGHT_TOTAL / DISH_WEIGHTS.length; // 10
-  let historyRows = 0;
-  for (let dayBack = 187; dayBack >= 8; dayBack--) {
-    const soldOn = new Date(today.getTime() - dayBack * MS_PER_DAY);
-    // Seasonal factor: weekends sell ~60% more.
-    const dow = new Date(
-      soldOn.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE,
-    ).getUTCDay();
-    const weekendBoost = dow === 0 || dow === 6 ? 1.6 : 1.0;
+
+  // --- ventana del histórico: 18 meses terminando AYER ---------------------
+  // `sales_history` NUNCA incluye HOY: las ventas de hoy y de los últimos 7
+  // días son ventas REALES (Order→Sale, paso 8) — una fuente independiente,
+  // no una continuación del histórico sintético.
+  const HISTORY_MONTHS = 18;
+  const yesterday = new Date(today.getTime() - MS_PER_DAY);
+  const yesterdayLocal = new Date(
+    yesterday.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE,
+  );
+  const historyStartLocalMs = Date.UTC(
+    yesterdayLocal.getUTCFullYear(),
+    yesterdayLocal.getUTCMonth() - HISTORY_MONTHS,
+    yesterdayLocal.getUTCDate(),
+  );
+  const historyStart = new Date(
+    historyStartLocalMs - LIMA_OFFSET_MIN * MS_PER_MINUTE,
+  );
+  const totalHistoryDays =
+    Math.round((yesterday.getTime() - historyStart.getTime()) / MS_PER_DAY) + 1;
+
+  const historyRowsData: Prisma.SalesHistoryCreateManyInput[] = [];
+  // 'YYYY-MM-DD' (Lima) → Σ qty de todos los platos ese día. Reusado por el
+  // paso 7e (ForecastRun históricas para /forecasting/accuracy) para no
+  // recalcular la demanda real dos veces.
+  const dailyActualTotal = new Map<string, number>();
+  let daysWithSales = 0;
+
+  for (
+    let ms = historyStart.getTime();
+    ms <= yesterday.getTime();
+    ms += MS_PER_DAY
+  ) {
+    const soldOn = new Date(ms);
+    const localDay = new Date(ms + LIMA_OFFSET_MIN * MS_PER_MINUTE);
+    const dow = localDay.getUTCDay();
+    // `WEEKDAY_MULTIPLIER` cubre las 7 claves (0-6) — `?? 1` es solo defensa
+    // de tipos, nunca se ejerce en la práctica.
+    const weekdayMult = WEEKDAY_MULTIPLIER[dow] ?? 1;
+
+    const eventUplift = gastroEventFor(localDay)?.uplift ?? 1;
+    const payUplift = paydayUplift(localDay);
+    const dateKey = limaDateKey(localDay);
+    let dayTotal = 0;
+
     for (let dishIdx = 0; dishIdx < menuItems.length; dishIdx++) {
       const mi = menuItems[dishIdx];
       if (!mi) continue;
@@ -1097,28 +1363,52 @@ async function main(): Promise<void> {
       const weight = DISH_WEIGHTS[dishIdx] ?? HIST_AVG_WEIGHT;
       const skipThreshold = (weight / DISH_WEIGHT_TOTAL) * 5;
       if (rnd() > skipThreshold) continue;
+
       // Scale quantity by relative popularity (vs the average weight of 10).
       const popularityScale = weight / HIST_AVG_WEIGHT;
       const baseQty = Math.max(1, Math.round(randInt(2, 9) * popularityScale));
-      const qty = Math.max(1, Math.round(baseQty * weekendBoost));
+      const noiseFactor = 1 + gaussianNoise(GAUSSIAN_NOISE_STD);
+      const qty = Math.max(
+        1,
+        Math.round(
+          baseQty * weekdayMult * eventUplift * payUplift * noiseFactor,
+        ),
+      );
+
       const unitPrice = mi.price;
       const total = unitPrice.mul(qty);
-      await prisma.salesHistory.create({
-        data: {
-          tenantId: TENANT_ID,
-          soldOn,
-          dishName: mi.name,
-          menuItemId: mi.id,
-          qty,
-          unitPrice,
-          total,
-          externalRef: `hist-${dayBack}-${mi.id.slice(0, 8)}`,
-        },
+      historyRowsData.push({
+        tenantId: TENANT_ID,
+        soldOn,
+        dishName: mi.name,
+        menuItemId: mi.id,
+        qty,
+        unitPrice,
+        total,
+        externalRef: `synthetic-${dateKey}-${mi.id.slice(0, 8)}`,
       });
-      historyRows++;
+      dayTotal += qty;
+    }
+
+    if (dayTotal > 0) {
+      dailyActualTotal.set(dateKey, dayTotal);
+      daysWithSales++;
     }
   }
-  console.log(`  ✓ ${historyRows} filas de histórico (~6 meses+, dayBack=187)`);
+
+  // Batch insert — createMany en chunks en vez de miles de `create` uno-a-uno
+  // (18 meses × 10 platos ≈ varios miles de filas; uno-a-uno sería lento).
+  const CREATE_MANY_CHUNK = 2000;
+  for (let i = 0; i < historyRowsData.length; i += CREATE_MANY_CHUNK) {
+    await prisma.salesHistory.createMany({
+      data: historyRowsData.slice(i, i + CREATE_MANY_CHUNK),
+    });
+  }
+  console.log(
+    `  ✓ ${historyRowsData.length} filas de histórico SINTÉTICO ` +
+      `(${HISTORY_MONTHS} meses, ${totalHistoryDays} días, ${daysWithSales} ` +
+      `con ventas — RNG determinista, ver bloque "MODELO GENERATIVO")`,
+  );
 
   // 7b) Movimientos de inventario type='sale' explotando el BOM POR PLATO de la
   // sales_history sembrada. Alimenta HU-05-11 (ingredient coverage) con consumo
@@ -1476,21 +1766,17 @@ async function main(): Promise<void> {
   // en la demo sin necesidad de esperar el job asíncrono (BullMQ + core-ai).
   // Los `points` son valores realistas de demanda diaria total (≈ 35-55 platos/día
   // con estacionalidad semanal). Se documenta como dato seeded, no inferido.
+  // `observations`/`spanDays`/`dataQuality` reflejan el histórico REAL recién
+  // generado en el paso 7 (18 meses ⇒ spanDays > GOOD_MIN_DAYS=365 de
+  // `sales-aggregation.util.ts` ⇒ 'good', ya no 'few_shot').
   {
     const forecastStart = new Date(today.getTime() + MS_PER_DAY); // mañana Lima
     const points = Array.from({ length: 14 }, (_, i) => {
       const d = new Date(forecastStart.getTime() + i * MS_PER_DAY);
-      const ds = (() => {
-        const dd = new Date(d.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE);
-        const y = dd.getUTCFullYear();
-        const m = String(dd.getUTCMonth() + 1).padStart(2, '0');
-        const day = String(dd.getUTCDate()).padStart(2, '0');
-        return `${y}-${m}-${day}`;
-      })();
+      const localD = new Date(d.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE);
+      const ds = limaDateKey(localD);
       // Estacionalidad semanal: sábado (dow=6) y domingo (dow=0) venden ~40% más.
-      const dow = new Date(
-        d.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE,
-      ).getUTCDay();
+      const dow = localD.getUTCDay();
       const weekendBoost = dow === 0 || dow === 6 ? 1.4 : 1.0;
       const yhat = Math.round(42 * weekendBoost); // platos totales/día
       return {
@@ -1510,9 +1796,9 @@ async function main(): Promise<void> {
         status: 'completed',
         model: 'AutoETS',
         baseline: 'SeasonalNaive',
-        observations: 179, // filas con ventas en el histórico
-        spanDays: 187,
-        dataQuality: 'few_shot',
+        observations: daysWithSales, // días con al menos una venta en el histórico sintético
+        spanDays: totalHistoryDays,
+        dataQuality: 'good', // 18 meses > GOOD_MIN_DAYS=365
         points: points as unknown as Prisma.InputJsonValue,
         completedAt: new Date(),
       },
@@ -1521,6 +1807,130 @@ async function main(): Promise<void> {
       `  ✓ ForecastRun completada sembrada (id=${forecastRun.id.slice(0, 8)}, ` +
         `horizon=14, yhat_total=${points.reduce((s, p) => s + p.yhat, 0)} platos)`,
     );
+  }
+
+  // 7e) ForecastRun HISTÓRICAS (Lote B2) — para que GET /forecasting/accuracy
+  // (HU-08-08) tenga fechas YA TRANSCURRIDAS que comparar contra `sales_history`.
+  // Antes de este lote, sales_history quedaba congelado ~8 días antes de "hoy" y
+  // ninguna corrida sembrada tenía target_date <= último día con ventas, así que
+  // el endpoint siempre respondía `needsMoreData:true` (documentado como
+  // limitación conocida en `specs/e08/HU-08-08-accuracy.spec.md`). Ahora que el
+  // histórico llega hasta AYER (paso 7), se siembran DOS corridas `completed`
+  // "pasadas" cuyos `points` caen dentro de esa ventana ya transcurrida:
+  //   - Run A (hace ~15 días): horizon=14, predice los 14 días que terminan AYER.
+  //   - Run B (hace ~8 días): horizon=14, re-predice los últimos 7 días
+  //     transcurridos (+7 días aún futuros) — el merge multi-corrida de
+  //     `getAccuracy` hace que B (más reciente) GANE esos 7 días solapados
+  //     sobre A, exactamente el escenario que documenta el spec.
+  // Los `yhat` se derivan de la demanda REAL simulada (`dailyActualTotal`,
+  // calculada en el paso 7) más un error gaussiano realista — nunca son
+  // idénticos al real (evita un SMAPE ≈0% que "huela a trampa"). Si algún día
+  // igual queda con `actual=0` (caso borde: los 10 platos se salteron ese
+  // día), se predice 0 exacto en vez de aplicar el error — evita el 200% de
+  // SMAPE que penaliza CUALQUIER predicción no-cero contra un real
+  // exactamente 0 (ver el "AJUSTE DOCUMENTADO" en el paso 7, mismo motivo por
+  // el que el lunes dejó de ser cero exacto).
+  {
+    const HIST_RUN_ERROR_STD = 0.1; // desvío del error simulado del pronóstico — realista (SMAPE resultante de un dígito alto/dos bajos), sin ser una trampa.
+    const BAND_LO_FACTOR = 0.82;
+    const BAND_HI_FACTOR = 1.18;
+
+    // Fallback para fechas del horizonte aún futuras al momento del seed
+    // (solo aplica a Run B): promedio de los últimos 14 días CON ventas —
+    // nunca se compara contra `sales_history` (accuracy solo mira
+    // target_date <= último día con ventas), solo debe ser plausible si
+    // alguien consulta /forecasting/predictions.
+    const recentTotals = [...dailyActualTotal.values()].slice(-14);
+    const recentAvgDailyTotal = recentTotals.length
+      ? recentTotals.reduce((s, v) => s + v, 0) / recentTotals.length
+      : 42;
+
+    type SeedPoint = {
+      target_date: string;
+      yhat: number;
+      yhat_lo: number;
+      yhat_hi: number;
+    };
+
+    function buildHistoricalPoints(
+      forecastStart: Date,
+      horizon: number,
+    ): SeedPoint[] {
+      return Array.from({ length: horizon }, (_, i) => {
+        const d = new Date(forecastStart.getTime() + i * MS_PER_DAY);
+        const localD = new Date(d.getTime() + LIMA_OFFSET_MIN * MS_PER_MINUTE);
+        const dateKey = limaDateKey(localD);
+        const isElapsed = d.getTime() <= yesterday.getTime();
+
+        let yhat: number;
+        if (isElapsed) {
+          const actual = dailyActualTotal.get(dateKey) ?? 0; // 0 = lunes cerrado, no "sin dato"
+          if (actual === 0) {
+            yhat = 0; // un modelo real predice ~0 en un día siempre cerrado
+          } else {
+            const errorFactor = 1 + gaussianNoise(HIST_RUN_ERROR_STD);
+            yhat = Math.max(0, Math.round(actual * errorFactor));
+          }
+        } else {
+          // Aún no transcurre — heurística simple (nivel reciente × estacionalidad
+          // semanal), no comparada por /accuracy.
+          const dow = localD.getUTCDay();
+          const weekdayMult = WEEKDAY_MULTIPLIER[dow] ?? 1;
+          yhat = Math.round(recentAvgDailyTotal * weekdayMult);
+        }
+
+        return {
+          target_date: dateKey,
+          yhat,
+          yhat_lo: Math.round(yhat * BAND_LO_FACTOR),
+          yhat_hi: Math.round(yhat * BAND_HI_FACTOR),
+        };
+      });
+    }
+
+    const HORIZON = 14;
+    // Run A: completedAt hace 15 días ⇒ su horizonte de 14 días (empieza al día
+    // siguiente) cae EXACTAMENTE en [hoy-14 .. hoy-1] — el histórico completo
+    // transcurrido, alineado con `yesterday` (último día con `sales_history`).
+    const runACompletedAt = new Date(today.getTime() - 15 * MS_PER_DAY);
+    const runAStart = new Date(runACompletedAt.getTime() + MS_PER_DAY);
+    const runAPoints = buildHistoricalPoints(runAStart, HORIZON);
+
+    // Run B: completedAt hace 8 días ⇒ re-predice los últimos 7 días
+    // transcurridos (gana sobre Run A ahí) + 7 días aún futuros.
+    const runBCompletedAt = new Date(today.getTime() - 8 * MS_PER_DAY);
+    const runBStart = new Date(runBCompletedAt.getTime() + MS_PER_DAY);
+    const runBPoints = buildHistoricalPoints(runBStart, HORIZON);
+
+    const historicalRuns = [
+      { completedAt: runACompletedAt, points: runAPoints, label: 'A (-15d)' },
+      { completedAt: runBCompletedAt, points: runBPoints, label: 'B (-8d)' },
+    ];
+
+    for (const run of historicalRuns) {
+      const created = await prisma.forecastRun.create({
+        data: {
+          tenantId: TENANT_ID,
+          scope: 'total',
+          horizon: HORIZON,
+          engine: 'ml',
+          status: 'completed',
+          model: 'LightGBM',
+          baseline: 'SeasonalNaive',
+          observations: daysWithSales,
+          spanDays: totalHistoryDays,
+          dataQuality: 'good',
+          points: run.points as unknown as Prisma.InputJsonValue,
+          contextStatus: 'full',
+          createdAt: run.completedAt,
+          completedAt: run.completedAt,
+        },
+      });
+      console.log(
+        `  ✓ ForecastRun histórica sembrada [${run.label}] (id=${created.id.slice(0, 8)}) ` +
+          `para GET /forecasting/accuracy`,
+      );
+    }
   }
 
   // 8) Ventas REALES: Order → OrderItem → Sale → Payment.
