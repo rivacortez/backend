@@ -369,7 +369,8 @@ describe('ChatService — LOTE B3: clasificación de intención', () => {
     );
 
     expect(result.answer).toContain('91 platos');
-    expect(result.answer).toContain('S/ 4236.05');
+    // OBS-2 · es-PE thousands separator in the narrated figure.
+    expect(result.answer).toContain('S/ 4,236.05');
     expect(result.answer).toContain('ticket promedio por plato');
     expect(result.answer).toContain('S/ 46.55/plato');
     expect(result.forecast?.estimatedRevenue).toEqual({

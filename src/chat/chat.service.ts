@@ -192,7 +192,7 @@ export class ChatService {
       AVG_UNIT_PRICE_WINDOW_DAYS,
     );
     const revenueText = estimatedRevenue
-      ? ` Estimado en S/ ${estimatedRevenue.total.toFixed(2)} según tu ticket ` +
+      ? ` Estimado en S/ ${estimatedRevenue.total.toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} según tu ticket ` +
         `promedio por plato de los últimos ${estimatedRevenue.basisDays} días ` +
         `(S/ ${estimatedRevenue.avgUnitPrice.toFixed(2)}/plato).`
       : '';
